@@ -1,6 +1,8 @@
 # 打包产物 (exe 走 GitHub Release, 不进仓库)
 build/
+buildqt/
 dist/
+distqt/
 *.spec
 
 # 运行时生成

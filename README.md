@@ -1,14 +1,20 @@
 # 发票助手 🧾
 
 本地发票统计工具：解析电子发票 PDF 的**商品明细**，输出金额 / 税额 / 价税合计，
-带**网页图形界面**和**命令行版**两种用法。数据不出本机。
+带**桌面版**、**网页版**和**命令行版**三种用法。数据不出本机。
 
 ## 下载
 
-到 [Releases](https://github.com/wangbq666/fapiao-helper/releases) 下载 `发票助手.exe`，
-双击运行会自动打开浏览器界面（免安装、免 Python）。
+到 [Releases](https://github.com/wangbq666/fapiao-helper/releases)：
 
-## 界面
+| 资产 | 说明 |
+|------|------|
+| `fapiao-helper-desktop-v1.1.exe` | **桌面版**（PySide6，推荐）：独立窗口，PDF 直接渲染 |
+| `fapiao-helper-v1.0.exe` | 网页版：双击后自动打开浏览器 |
+
+两个都免安装、免 Python。
+
+## 界面（桌面版 / 网页版通用）
 
 ```
 ┌───────────────┬──────────────────────────────┐
@@ -45,10 +51,14 @@ py 发票统计工具.py "D:\发票归档" -r :: 递归子文件夹
 | 文件 | 说明 |
 |------|------|
 | `发票解析.py` | 解析核心：抬头 + 按 PDF 文字坐标还原商品明细列 |
+| `发票助手Qt.py` | **桌面版**（PySide6 + PyMuPDF，独立窗口） |
 | `发票助手.py` | 网页服务端（本地 HTTP，端口 8765，`FP_PORT` 可改） |
-| `index.html` | 前端单页界面 |
+| `index.html` | 网页版前端单页界面 |
 | `发票统计工具.py` | 命令行版 |
 | `使用说明.md` | 详细使用说明 |
+
+桌面版预览用 PyMuPDF 直接渲染进 `QGraphicsView`（滚轮缩放 / 按住拖动 /
+原生滚动条 / 缩放滑块），后台 `QThreadPool` 解析不卡界面。
 
 ## 解析说明
 
@@ -64,6 +74,10 @@ py 发票统计工具.py "D:\发票归档" -r :: 递归子文件夹
 ## 重新打包 exe
 
 ```bat
+:: 桌面版（约 130MB，含 PySide6 + PyMuPDF）
+py -m PyInstaller --onefile --noconsole --name 发票助手Qt --distpath distqt 发票助手Qt.py
+
+:: 网页版（约 40MB）
 py -m PyInstaller --onefile --noconsole --name 发票助手 ^
    --add-data "index.html;." --add-data "发票解析.py;." 发票助手.py
 ```
