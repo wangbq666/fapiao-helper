@@ -1,0 +1,14 @@
+# 打包产物 (exe 走 GitHub Release, 不进仓库)
+build/
+dist/
+*.spec
+
+# 运行时生成
+__pycache__/
+*.pyc
+_files/
+
+# 本机文件 / 输出
+*.lnk
+发票统计_*.csv
+报销商品明细_*.csv
