@@ -11,26 +11,143 @@
 """
 import csv
 import datetime
+import json
+import math
 import os
 import sys
+import threading
+import time as _time
 
-import fitz
-from PySide6.QtCore import QObject, QMimeData, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QFont, QIcon,
-                           QImage, QPainter, QPixmap)
+_T0 = _time.perf_counter()  # 冷启动计时起点(越靠前越准)
+
+def _fitz():
+    """延迟导入 PyMuPDF(约 0.11s), 让窗口先出来。"""
+    import fitz as _m
+    return _m
+
+from PySide6.QtCore import (QObject, QMimeData, QRectF, QRunnable, Qt,
+                            QSettings, QThreadPool, QTimer, Signal)
+from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QIcon,
+                           QImage, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QFrame, QGraphicsScene,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog,
+    QFormLayout, QFrame, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow,
-    QPushButton, QSlider, QSplitter, QTableWidget, QTableWidgetItem,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QSlider, QSplitter, QStackedWidget, QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from 发票解析 import extract_invoice  # noqa: E402
 
 MIME_ROWS = 'application/x-invoice-rows'
-CLIP = 'C:/Users/yqh/Desktop/nj542发票'
+
+# ---------------- 本机设置(只存本地, 不联网) ----------------
+SETTINGS = QSettings('FapiaoHelper', 'FapiaoHelper')
+
+
+def _dl_dir():
+    """每台电脑的「下载」文件夹(默认 C:\\Users\\<用户名>\\Downloads)。"""
+    d = ''
+    try:
+        import ctypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [('Data1', ctypes.c_uint32),
+                        ('Data2', ctypes.c_uint16),
+                        ('Data3', ctypes.c_uint16),
+                        ('Data4', ctypes.c_ubyte * 8)]
+
+        # FOLDERID_Downloads
+        fid = GUID(0x374DE290, 0x123F, 0x4565,
+                   (0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+        path = ctypes.c_wchar_p()
+        if (ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(fid), 0, None, ctypes.byref(path)) == 0
+                and path.value):
+            d = path.value
+            ctypes.windll.ole32.CoTaskMemFree(path)
+    except Exception:  # noqa: BLE001
+        d = ''
+    if not d:
+        d = os.path.join(os.path.expanduser('~'), 'Downloads')
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            d = os.path.expanduser('~')
+    return d
+
+
+def cfg_get(key, fallback=None):
+    v = SETTINGS.value(key, fallback or '')
+    v = str(v).strip() if v else ''
+    return v if v and os.path.isdir(v) else (fallback or '')
+
+
+def cfg_dir():
+    """选择文件对话框的起始目录(默认「下载」)。"""
+    return cfg_get('invoice_dir', _dl_dir())
+
+
+def cfg_outdir():
+    """CSV / 报告的默认保存目录(默认「下载」)。"""
+    return cfg_get('out_dir', _dl_dir())
+
+
+def cfg_reset():
+    SETTINGS.clear()
+    SETTINGS.sync()
+
+
+# ---------------- 历史记录(只存加入报销的, 按加入那天分组, 跨重启保留) ----------
+HIST_FILE = os.environ.get('FAPIAO_HIST') or os.path.join(
+    os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+    'FapiaoHelper', 'history.json')
+
+
+def hist_load():
+    try:
+        with open(HIST_FILE, encoding='utf-8') as fh:
+            items = json.load(fh).get('items') or []
+        return [x for x in items
+                if isinstance(x, dict) and x.get('day') and x.get('path')]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def hist_save(items):
+    try:
+        os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+        tmp = HIST_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump({'v': 1, 'items': items}, fh, ensure_ascii=False)
+        os.replace(tmp, HIST_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _rate_num(rate):
+    """把 '13%' / '1%' / 0.13 / '免税' / None 转成小数税率。"""
+    if rate is None:
+        return 0.0
+    if isinstance(rate, (int, float)):
+        v = float(rate)
+        return v if v < 1 else v / 100.0
+    s = str(rate).strip()
+    if not s:
+        return 0.0
+    if s.endswith('%'):
+        try:
+            return float(s[:-1]) / 100.0
+        except ValueError:
+            return 0.0
+    try:
+        v = float(s)
+    except ValueError:
+        return 0.0
+    return v if v < 1 else v / 100.0
 
 
 def _fmt(n):
@@ -58,6 +175,87 @@ def _summary_row(items):
             seg += ' %.2f' % it['金额']
         parts.append(seg)
     return '；'.join(parts)
+
+
+def _elide_name(name, head=24, tail=12):
+    """文件名过长时中间省略, 保留扩展名。"""
+    name = str(name)
+    if len(name) <= head + tail + 1:
+        return name
+    return '%s…%s' % (name[:head], name[-tail:])
+
+
+def _warn_badge_pixmap():
+    """打不开文件时显示的警告徽标: 红圈 + 感叹号。"""
+    S = 56
+    img = QImage(S, S, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QPen(QColor('#ffffff'), 4.0))
+    p.setBrush(QColor('#e5484d'))
+    p.drawEllipse(QRectF(4, 4, S - 8, S - 8))
+    p.setPen(QColor('#ffffff'))
+    f = QFont()
+    f.setPixelSize(34)
+    f.setBold(True)
+    p.setFont(f)
+    p.drawText(QRectF(4, 2, S - 8, S - 8),
+               Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+               '!')
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+def _placeholder_pixmap():
+    """空白预览时显示的大图标: 一沓发票本子(纯 QPainter 绘制)。"""
+    W, H = 150, 164
+    img = QImage(W, H, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    def page(dx, dy, fill, border, w=104, h=128):
+        p.setPen(QPen(QColor(border), 1.6))
+        p.setBrush(QColor(fill))
+        p.drawRoundedRect(QRectF(14 + dx, 12 + dy, w, h), 9, 9)
+
+    # 后面两页(深色底上的浅灰层叠)
+    page(26, 22, '#454b55', '#565d68')
+    page(13, 11, '#565d68', '#6a727e')
+
+    # 最上面一页(浅色纸张)
+    page(0, 0, '#f4f6f9', '#d9dee5')
+    x0, y0, w, h = 14.0, 12.0, 104.0, 128.0
+
+    def bar(bx, by, bw, color, r=4.0, bh=8.0):
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color))
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), r, r)
+
+    bar(x0 + 12, y0 + 14, 46, '#1f6feb')          # 标题色带
+    p.setPen(QPen(QColor('#e4e8ee'), 1.4))
+    p.drawLine(int(x0 + 12), int(y0 + 34), int(x0 + w - 12), int(y0 + 34))
+    bar(x0 + 12, y0 + 46, 68, '#d7dde4')          # 明细行
+    bar(x0 + 12, y0 + 62, 78, '#d7dde4')
+    bar(x0 + 12, y0 + 78, 56, '#d7dde4')
+    bar(x0 + 12, y0 + 98, 40, '#9fc0ff')          # 合计行
+    bar(x0 + w - 56, y0 + 98, 44, '#c9d1db')
+
+    # ¥ 徽标(压在右下角)
+    p.setPen(QPen(QColor('#1f6feb'), 3.0))
+    p.setBrush(QColor('#1f6feb'))
+    p.drawEllipse(QRectF(94, 118, 44, 44))
+    p.setPen(QColor('#ffffff'))
+    f = QFont()
+    f.setPixelSize(26)
+    f.setBold(True)
+    p.setFont(f)
+    p.drawText(QRectF(94, 118, 44, 44),
+               Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+               '¥')
+    p.end()
+    return QPixmap.fromImage(img)
 
 
 # ======================================================================
@@ -88,6 +286,21 @@ class PDFView(QGraphicsView):
         self._hint_lbl.setWordWrap(True)
         self._hint_lbl.hide()
 
+        # 空白时的大图标: 一沓发票本子(纯代码绘制, 不依赖图片资源)
+        self._ph_pixmap = _placeholder_pixmap()
+        self._ph_lbl = QLabel(self.viewport())
+        self._ph_lbl.setPixmap(self._ph_pixmap)
+        self._ph_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._ph_lbl.hide()
+
+        # 打不开文件时叠加的警告徽标
+        self._warn_lbl = QLabel(self.viewport())
+        self._warn_lbl.setPixmap(_warn_badge_pixmap())
+        self._warn_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._warn_lbl.hide()
+
         self._rt = QTimer(self)
         self._rt.setSingleShot(True)
         self._rt.setInterval(200)
@@ -102,6 +315,13 @@ class PDFView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
 
+    def set_warn(self, on):
+        """打不开文件时显示警告徽标。"""
+        self._warn_lbl.setVisible(bool(on))
+        if on:
+            self._warn_lbl.raise_()
+        self._layout_hint()
+
     @property
     def hint(self):
         return self._hint_lbl.text()
@@ -110,11 +330,38 @@ class PDFView(QGraphicsView):
     def hint(self, s):
         self._hint_lbl.setText(s or '')
         self._hint_lbl.setVisible(bool(s))
+        self._ph_lbl.setVisible(bool(s))
         self._hint_lbl.raise_()
+        self._ph_lbl.raise_()
         self._layout_hint()
 
     def _layout_hint(self):
-        self._hint_lbl.setGeometry(self.viewport().rect())
+        vp = self.viewport().rect()
+        if not self._ph_lbl.isVisible():
+            self._hint_lbl.setGeometry(vp)
+            return
+
+        pm = self._ph_pixmap
+        iw, ih = pm.width(), pm.height()
+        gap, text_h = 10, 46
+        # 视口太矮时整体等比缩小图标
+        if ih + gap + text_h + 8 > vp.height():
+            k = max(0.45, (vp.height() - gap - text_h - 8) / float(ih))
+            iw, ih = int(iw * k), int(ih * k)
+            self._ph_lbl.setPixmap(pm.scaled(
+                iw, ih, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+        else:
+            self._ph_lbl.setPixmap(pm)
+
+        top = max(4, (vp.height() - ih - gap - text_h) // 2)
+        x = (vp.width() - iw) // 2
+        self._ph_lbl.setGeometry(x, top, iw, ih)
+        y2 = top + ih + gap
+        self._hint_lbl.setGeometry(0, y2, vp.width(),
+                                   max(text_h, vp.height() - y2))
+        if self._warn_lbl.isVisible():
+            self._warn_lbl.setGeometry(x + iw - 40, max(0, top - 8), 56, 56)
 
     # ---------------- 文档 ----------------
     def clear(self):
@@ -128,7 +375,8 @@ class PDFView(QGraphicsView):
     def load(self, path):
         self.clear()
         try:
-            doc = fitz.open(path)
+            fz = _fitz()
+            doc = fz.open(path)
             rects = [(p.rect.width, p.rect.height) for p in doc]
             doc.close()
         except Exception:
@@ -179,8 +427,9 @@ class PDFView(QGraphicsView):
 
     def _render_page(self, idx, scale):
         try:
-            doc = fitz.open(self._path)
-            pix = doc[idx].get_pixmap(matrix=fitz.Matrix(scale, scale))
+            fz = _fitz()
+            doc = fz.open(self._path)
+            pix = doc[idx].get_pixmap(matrix=fz.Matrix(scale, scale))
             doc.close()
             return QImage(pix.samples, pix.width, pix.height, pix.stride,
                           QImage.Format.Format_RGB888).copy()
@@ -304,6 +553,31 @@ class FileTable(QTableWidget):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        # 空态提示(列表没文件时居中显示)
+        self._hint = QLabel('点「＋选择文件」添加发票\n也可以把 PDF 拖到这里',
+                            self.viewport())
+        self._hint.setObjectName('filehint')
+        self._hint.setAlignment(Qt.AlignmentFlag.AlignHCenter |
+                                Qt.AlignmentFlag.AlignVCenter)
+        self._hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._hint.hide()
+
+    def set_empty(self, empty):
+        if empty:
+            self._hint.show()
+            self._layout_hint()
+            self._hint.raise_()
+        else:
+            self._hint.hide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._hint.isVisible():
+            self._layout_hint()
+
+    def _layout_hint(self):
+        self._hint.setGeometry(0, 0, self.viewport().width(),
+                               self.viewport().height())
 
     def mimeTypes(self):
         return [MIME_ROWS]
@@ -344,6 +618,7 @@ class DetailTable(QTableWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setColumnCount(len(self.COLS))
         self.setHorizontalHeaderLabels(self.COLS)
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(34)
@@ -396,6 +671,7 @@ class ParseTask(QRunnable):
         self.sig = ParseSignals()
 
     def run(self):
+        from 发票解析 import extract_invoice  # 延迟导入, 冷启动少 0.1s+
         try:
             inv = extract_invoice(self.path)
         except Exception as e:  # noqa: BLE001
@@ -406,38 +682,170 @@ class ParseTask(QRunnable):
 
 
 # ======================================================================
+#  设置对话框
+# ======================================================================
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('settings')
+        self.setWindowTitle('设置')
+        self.setModal(True)
+        self.setFixedWidth(470)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(12)
+
+        t = QLabel('设置')
+        t.setObjectName('dlgTitle')
+        lay.addWidget(t)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight |
+                               Qt.AlignmentFlag.AlignVCenter)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(12)
+
+        # 1) 默认发票目录
+        self.ed_dir = QLineEdit(cfg_dir())
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row1.addWidget(self.ed_dir, 1)
+        b1 = QPushButton('浏览…')
+        b1.setObjectName('ghost')
+        b1.clicked.connect(lambda: self._browse(self.ed_dir))
+        row1.addWidget(b1)
+        form.addRow('默认发票目录', row1)
+
+        # 2) 报告保存目录
+        self.ed_out = QLineEdit(cfg_outdir())
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(self.ed_out, 1)
+        b2 = QPushButton('浏览…')
+        b2.setObjectName('ghost')
+        b2.clicked.connect(lambda: self._browse(self.ed_out))
+        row2.addWidget(b2)
+        form.addRow('报告保存目录', row2)
+
+        # 3) 价格是否含税
+        self.ck_incl = QCheckBox('价格按含税价计算')
+        self.ck_incl.setChecked(
+            str(SETTINGS.value('price_incl', '0')) in ('1', 'true', 'True'))
+        form.addRow('价格口径', self.ck_incl)
+        lay.addLayout(form)
+
+        note = QLabel(
+            '说明：价格默认不含税（与票面“金额”一致，直接使用）。\n'
+            '勾选“价格按含税价计算”后，明细里的金额被视为含税价，按税率反推：\n'
+            '  不含税金额 = 含税价 ÷ (1 + 税率)\n'
+            '  税额 = 含税价 − 不含税金额\n'
+            '  价税合计 = 含税价\n'
+            '合计、按商品汇总、CSV 与 Excel 报告会同时按该口径重算。')
+        note.setObjectName('tip')
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        tip = QLabel('设置只保存在本机, 文件始终在本地解析。')
+        tip.setObjectName('tip')
+        lay.addWidget(tip)
+        lay.addStretch(1)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        b_reset = QPushButton('重置默认设置')
+        b_reset.setObjectName('ghost')
+        b_reset.clicked.connect(self._reset)
+        btns.addWidget(b_reset)
+        btns.addStretch(1)
+        b_cancel = QPushButton('取消')
+        b_cancel.setObjectName('ghost')
+        b_cancel.clicked.connect(self.reject)
+        btns.addWidget(b_cancel)
+        b_ok = QPushButton('保存')
+        b_ok.clicked.connect(self.accept)
+        btns.addWidget(b_ok)
+        lay.addLayout(btns)
+
+    def _browse(self, ed):
+        d = QFileDialog.getExistingDirectory(self, '选择文件夹', ed.text())
+        if d:
+            ed.setText(d)
+
+    def _reset(self):
+        SETTINGS.clear()
+        SETTINGS.sync()
+        self.ed_dir.setText(_dl_dir())
+        self.ed_out.setText(_dl_dir())
+        self.ck_incl.setChecked(False)
+
+    def values(self):
+        d = self.ed_dir.text().strip() or _dl_dir()
+        o = self.ed_out.text().strip() or d
+        return d, o, self.ck_incl.isChecked()
+
+
+# ======================================================================
 #  主窗口
 # ======================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('发票助手')
-        self.resize(1460, 900)
+        self._apply_default_size()
         self.setWindowIcon(self._make_icon())
         self.files = []
         self._seq = 0
         self._by_item = False
+        self.price_incl = str(SETTINGS.value('price_incl', '0')) in ('1', 'true', 'True')
+        self.history = hist_load()     # 历史记录(跨重启保留)
+        self._hist_on = False          # 当前是否在历史视图
+        self._hist_day = None          # 选中的那天
+        self._hist_days = []           # 日期列表(新→旧)
+        self._suspend = 0          # >0 时暂停表格刷新(批量操作用)
+        self._defer = QTimer(self)  # 解析完成的刷新合并, 一次事件循环只刷一遍
+        self._defer.setSingleShot(True)
+        self._defer.setInterval(120)
+        self._defer.timeout.connect(self._deferred_refresh)
         self._cur_id = None
         self._pool = QThreadPool.globalInstance()
         self._build_ui()
-        if os.path.isdir(CLIP):
-            self.open_folder(CLIP)
+        self._sync_incl_btn()
+        self._sync_hist_btn()
+        self.refresh_files()
+        self.refresh_detail()
+
+    def _apply_default_size(self):
+        """默认 1080x720 居中; 不锁死尺寸, 右上角最大化/拉伸都可用。"""
+        scr = self.screen() or QGuiApplication.primaryScreen()
+        av = scr.availableGeometry()
+        w, h = min(1080, av.width()), min(720, av.height())
+        self.setMinimumSize(880, 560)
+        self.resize(w, h)
+        self.move(av.x() + (av.width() - w) // 2,
+                  av.y() + (av.height() - h) // 2)
 
     @staticmethod
-    def _make_icon():
-        img = QImage(64, 64, QImage.Format.Format_ARGB32)
+    def _make_icon(size=64):
+        """应用图标: 白底圆角卡片 + 蓝色大 ¥。"""
+        img = QImage(size, size, QImage.Format.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 0))
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor('#1f6feb'))
-        p.drawRoundedRect(4, 4, 56, 56, 14, 14)
-        p.setPen(QColor('white'))
+        m = size * 0.04
+        p.setPen(QPen(QColor('#cfe0ff'), max(1.0, size * 0.055)))
+        p.setBrush(QColor('#ffffff'))
+        p.drawRoundedRect(QRectF(m, m, size - 2 * m, size - 2 * m),
+                          size * 0.24, size * 0.24)
         f = QFont()
-        f.setPixelSize(34)
+        f.setPixelSize(int(size * 0.80))
         f.setBold(True)
         p.setFont(f)
-        p.drawText(img.rect(), (Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter), '¥')
+        p.setPen(QColor('#1f6feb'))
+        p.drawText(QRectF(0, -size * 0.02, size, size),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   '¥')
         p.end()
         return QIcon(QPixmap.fromImage(img))
 
@@ -454,7 +862,9 @@ class MainWindow(QMainWindow):
         sp.setChildrenCollapsible(False)
         sp.addWidget(self._left_panel())
         sp.addWidget(self._right_panel())
-        sp.setSizes([450, 1010])
+        sp.setSizes([350, 730])
+        sp.setStretchFactor(0, 0)
+        sp.setStretchFactor(1, 1)
         vbox.addWidget(sp, 1)
 
     def _header(self):
@@ -466,22 +876,54 @@ class MainWindow(QMainWindow):
         t = QLabel('🧾 发票助手')
         t.setObjectName('title')
         lay.addWidget(t)
-        self.lbl_folder = QLabel('未打开文件夹')
-        self.lbl_folder.setObjectName('folder')
-        self.lbl_folder.setMaximumWidth(560)
-        lay.addWidget(self.lbl_folder)
         self.lbl_sum = QLabel('报销 0 张 ｜ 价税合计 0.00')
         self.lbl_sum.setObjectName('sum')
         lay.addWidget(self.lbl_sum)
         lay.addStretch(1)
-        bar.setFixedHeight(50)
+        self.btn_hist = QPushButton('🕘 历史记录')
+        self.btn_hist.setObjectName('headbtn')
+        self.btn_hist.setCheckable(True)
+        self.btn_hist.setToolTip('按天查看已确认报销的发票（只存加入报销的）')
+        self.btn_hist.clicked.connect(self.toggle_history)
+        lay.addWidget(self.btn_hist)
+        tip = QLabel('本地解析 · 文件不上传')
+        tip.setObjectName('headtip')
+        lay.addWidget(tip)
+        gear = QPushButton('⚙')
+        gear.setObjectName('gear')
+        gear.setFixedSize(30, 30)
+        gear.setToolTip('设置')
+        gear.clicked.connect(self.open_settings)
+        lay.addWidget(gear)
+        bar.setFixedHeight(52)
         return bar
+
+    def open_settings(self):
+        d = SettingsDialog(self)
+        if d.exec():
+            inv_dir, out_dir, incl = d.values()
+            SETTINGS.setValue('invoice_dir', inv_dir)
+            SETTINGS.setValue('out_dir', out_dir)
+            SETTINGS.sync()
+            self.set_price_incl(incl)
+            self.statusBar().showMessage('设置已保存', 3000)
 
     def _left_panel(self):
         pan = QFrame()
         pan.setObjectName('panel')
         lay = QVBoxLayout(pan)
         lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(9)
+        self.left_stack = QStackedWidget()
+        self.left_stack.addWidget(self._file_page())      # 0: 文件列表
+        self.left_stack.addWidget(self._history_page())   # 1: 历史记录
+        lay.addWidget(self.left_stack, 1)
+        return pan
+
+    def _file_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(9)
 
         h = QHBoxLayout()
@@ -495,9 +937,6 @@ class MainWindow(QMainWindow):
 
         r1 = QHBoxLayout()
         r1.setSpacing(7)
-        self.btn_folder = QPushButton('📂 选择文件夹')
-        self.btn_folder.clicked.connect(self.pick_folder)
-        r1.addWidget(self.btn_folder)
         self.btn_addfile = QPushButton('＋选择文件')
         self.btn_addfile.clicked.connect(self.pick_files)
         r1.addWidget(self.btn_addfile)
@@ -515,19 +954,239 @@ class MainWindow(QMainWindow):
         b.setObjectName('ghost')
         b.clicked.connect(self.leave_all)
         r2.addWidget(b)
+        b = QPushButton('全部删除')
+        b.setObjectName('ghost')
+        b.clicked.connect(self.remove_all)
+        r2.addWidget(b)
         lay.addLayout(r2)
 
         self.file_table = FileTable()
         self.file_table.filesDropped.connect(lambda ps: self.add_paths(ps, join=True))
         self.file_table.cellClicked.connect(lambda r, c: self.preview_row(r))
         lay.addWidget(self.file_table, 1)
+        return page
 
-        self.lbl_others = QLabel('')
-        self.lbl_others.setObjectName('others')
-        self.lbl_others.setWordWrap(True)
-        self.lbl_others.hide()
-        lay.addWidget(self.lbl_others)
-        return pan
+    def _history_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        h = QHBoxLayout()
+        t = QLabel('历史记录')
+        t.setObjectName('panelTitle')
+        h.addWidget(t)
+        self.lbl_hist_cnt = QLabel('0 张')
+        self.lbl_hist_cnt.setObjectName('tip')
+        h.addWidget(self.lbl_hist_cnt)
+        h.addStretch(1)
+        b = QPushButton('清空')
+        b.setObjectName('ghost')
+        b.clicked.connect(self.hist_clear)
+        h.addWidget(b)
+        lay.addLayout(h)
+
+        tip = QLabel('按加入报销的那天分组 · 只存确认报销的')
+        tip.setObjectName('tip')
+        lay.addWidget(tip)
+
+        d1 = QLabel('选择日期')
+        d1.setObjectName('subhead')
+        lay.addWidget(d1)
+        self.hist_days = QListWidget()
+        self.hist_days.setObjectName('histdays')
+        self.hist_days.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.hist_days.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.hist_days.currentRowChanged.connect(self._hist_select_day)
+        lay.addWidget(self.hist_days, 1)
+
+        d2 = QLabel('当天发票')
+        d2.setObjectName('subhead')
+        lay.addWidget(d2)
+        self.hist_items = QTableWidget()
+        self.hist_items.setObjectName('histitems')
+        self.hist_items.setColumnCount(3)
+        self.hist_items.setHorizontalHeaderLabels(['文件', '金额', ''])
+        hh = self.hist_items.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hh.resizeSection(2, 82)
+        hh.setStretchLastSection(False)
+        self.hist_items.verticalHeader().setVisible(False)
+        self.hist_items.verticalHeader().setDefaultSectionSize(34)
+        self.hist_items.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.hist_items.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.hist_items.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.hist_items.cellClicked.connect(self._hist_click)
+        lay.addWidget(self.hist_items, 2)
+        return page
+
+    # ---------------- 历史记录 ----------------
+    def toggle_history(self):
+        self._hist_on = not self._hist_on
+        self.left_stack.setCurrentIndex(1 if self._hist_on else 0)
+        self._sync_hist_btn()
+        if self._hist_on:
+            self._hist_refresh_days()
+            self.statusBar().showMessage(
+                '历史记录: 按加入报销的那天分组', 3000)
+        else:
+            self.refresh_files()
+
+    def _sync_hist_btn(self):
+        if self._hist_on:
+            self.btn_hist.setText('🕘 返回文件')
+            self.btn_hist.setChecked(True)
+        else:
+            n = len(self.history)
+            self.btn_hist.setText('🕘 历史记录' + (' %d' % n if n else ''))
+            self.btn_hist.setChecked(False)
+
+    def _hist_add(self, f):
+        """只把加入报销成功的发票记进历史, 按“加入的那天”分组(存本地 JSON)。"""
+        inv = f.get('inv')
+        if not inv or inv.get('价税合计') is None:
+            return
+        day = datetime.date.today().isoformat()
+        path = f.get('path')
+        self.history = [x for x in self.history
+                        if not (x.get('path') == path and x.get('day') == day)]
+        self.history.append({
+            'day': day,
+            'ts': int(_time.time()),
+            'path': path,
+            'name': f.get('name') or os.path.basename(path or ''),
+            'seller': inv.get('销售方') or '',
+            'code': inv.get('发票号码') or '',
+            'date': inv.get('开票日期') or '',
+            'total': inv.get('价税合计'),
+        })
+        hist_save(self.history)
+        self._sync_hist_btn()
+        if self._hist_on:
+            self._hist_refresh_days()
+
+    def _hist_refresh_days(self):
+        counts = {}
+        for x in self.history:
+            counts[x['day']] = counts.get(x['day'], 0) + 1
+        self._hist_days = sorted(counts, reverse=True)     # 新 → 旧
+        self.lbl_hist_cnt.setText('%d 张 · %d 天'
+                                  % (len(self.history), len(self._hist_days)))
+        self.hist_days.blockSignals(True)
+        self.hist_days.clear()
+        if not self._hist_days:
+            it = QListWidgetItem('还没有历史记录\n(加入报销后自动记录)')
+            it.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.hist_days.addItem(it)
+        else:
+            for day in self._hist_days:
+                it = QListWidgetItem('%s · %d 张' % (day, counts[day]))
+                it.setData(Qt.ItemDataRole.UserRole, day)
+                self.hist_days.addItem(it)
+        self.hist_days.blockSignals(False)
+        idx = (self._hist_days.index(self._hist_day)
+               if self._hist_day in self._hist_days else 0)
+        self.hist_days.setCurrentRow(idx if self._hist_days else -1)
+
+    def _hist_select_day(self, row):
+        if row < 0 or row >= len(self._hist_days):
+            self._hist_day = None
+            self.hist_items.setRowCount(0)
+            return
+        self._hist_day = self._hist_days[row]
+        self._hist_refresh_items()
+
+    def _hist_items_of_day(self):
+        rows = [x for x in self.history if x.get('day') == self._hist_day]
+        rows.sort(key=lambda x: -(x.get('ts') or 0))
+        return rows
+
+    def _hist_refresh_items(self):
+        rows = self._hist_items_of_day()
+        self.hist_items.setRowCount(0)
+        for x in rows:
+            r = self.hist_items.rowCount()
+            self.hist_items.insertRow(r)
+            name = x.get('name') or os.path.basename(x.get('path') or '')
+            it = QTableWidgetItem('📄 ' + name)
+            it.setData(Qt.ItemDataRole.UserRole, x.get('path'))
+            it.setToolTip('%s\n销售方: %s\n发票号码: %s\n开票日期: %s\n加入报销: %s'
+                          % (x.get('path') or '', x.get('seller') or '-',
+                             x.get('code') or '-', x.get('date') or '-',
+                             x.get('day') or '-'))
+            self.hist_items.setItem(r, 0, it)
+
+            total = x.get('total')
+            c1 = QTableWidgetItem(('%.2f' % total)
+                                  if isinstance(total, (int, float)) else '')
+            c1.setForeground(QBrush(QColor('#1a7f37')))
+            c1.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                | Qt.AlignmentFlag.AlignVCenter)
+            self.hist_items.setItem(r, 1, c1)
+
+            box = QWidget()
+            bh = QHBoxLayout(box)
+            bh.setContentsMargins(6, 0, 6, 0)
+            bh.setSpacing(4)
+            path = x.get('path')
+            f = next((p for p in self.files if p['path'] == path), None)
+            if f and f['inReimb']:
+                b2 = QPushButton('已在报销')
+                b2.setObjectName('tiny')
+                b2.setEnabled(False)
+            else:
+                b2 = QPushButton('加入')
+                b2.setObjectName('tiny')
+                b2.clicked.connect(lambda _=False, p=path: self._hist_join(p))
+            bh.addWidget(b2)
+            self.hist_items.setCellWidget(r, 2, box)
+
+    def _hist_click(self, row, col):
+        it = self.hist_items.item(row, 0)
+        if not it:
+            return
+        path = it.data(Qt.ItemDataRole.UserRole)
+        text = it.text()
+        name = text[2:] if text.startswith('📄 ') else text
+        f = next((p for p in self.files if p['path'] == path), None)
+        if not f:
+            f = {'id': None, 'name': name, 'path': path, 'inReimb': False,
+                 'inv': None, 'parsing': False}
+        self.preview(f)          # 右上角照常展示选中的 PDF
+
+    def _hist_join(self, path):
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, '加入报销',
+                                '原文件已经不在了:\n%s' % path)
+            return
+        self.add_paths([path], join=True)
+        self.statusBar().showMessage('已加入报销: %s'
+                                     % os.path.basename(path), 3000)
+        self._hist_refresh_items()
+
+    def hist_clear(self):
+        if not self.history:
+            return
+        yes = QMessageBox.StandardButton.Yes
+        no = QMessageBox.StandardButton.No
+        if QMessageBox.question(
+                self, '清空历史',
+                '确定清空全部 %d 条历史记录吗?\n(不影响磁盘上的 PDF, '
+                '也不影响当前报销明细)' % len(self.history),
+                yes | no, no) != yes:
+            return
+        self.history = []
+        hist_save(self.history)
+        self._hist_day = None
+        self._sync_hist_btn()
+        self._hist_refresh_days()
 
     def _right_panel(self):
         w = QWidget()
@@ -538,7 +1197,9 @@ class MainWindow(QMainWindow):
         sp.setChildrenCollapsible(False)
         sp.addWidget(self._preview_panel())
         sp.addWidget(self._detail_panel())
-        sp.setSizes([400, 500])
+        sp.setSizes([360, 310])
+        sp.setStretchFactor(0, 1)
+        sp.setStretchFactor(1, 1)
         lay.addWidget(sp, 1)
         return w
 
@@ -556,7 +1217,10 @@ class MainWindow(QMainWindow):
         h.setSpacing(10)
         self.lbl_pvname = QLabel('发票原件')
         self.lbl_pvname.setObjectName('pvname')
-        h.addWidget(self.lbl_pvname, 1)
+        h.addWidget(self.lbl_pvname)
+        self.lbl_pvfile = QLabel('')
+        self.lbl_pvfile.setObjectName('pvfile')
+        h.addWidget(self.lbl_pvfile, 1)
         h.addWidget(QLabel('缩放'))
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(25, 400)
@@ -611,12 +1275,24 @@ class MainWindow(QMainWindow):
         self.btn_byitem.setObjectName('ghost')
         self.btn_byitem.clicked.connect(self.toggle_byitem)
         h.addWidget(self.btn_byitem)
+        self.btn_incl = QPushButton('价格含税')
+        self.btn_incl.setObjectName('ghost')
+        self.btn_incl.setToolTip(
+            '价格默认不含税。\n勾选后按含税价反推:\n'
+            '不含税金额 = 含税价 ÷ (1+税率)\n税额 = 含税价 − 不含税金额\n'
+            '价税合计 = 含税价')
+        self.btn_incl.clicked.connect(self.toggle_price_incl)
+        h.addWidget(self.btn_incl)
         b = QPushButton('清空报销')
         b.setObjectName('ghost')
         b.clicked.connect(self.leave_all)
         h.addWidget(b)
         b = QPushButton('导出 CSV')
+        b.setObjectName('ghost')
         b.clicked.connect(self.export_csv)
+        h.addWidget(b)
+        b = QPushButton('生成报告')
+        b.clicked.connect(self.generate_report)
         h.addWidget(b)
         lay.addWidget(head)
 
@@ -658,44 +1334,23 @@ class MainWindow(QMainWindow):
     # =================================================================
     #  文件管理
     # =================================================================
-    def pick_folder(self):
-        d = QFileDialog.getExistingDirectory(self, '选择文件夹', CLIP)
-        if d:
-            self.open_folder(d)
-
-    def open_folder(self, folder):
-        try:
-            names = os.listdir(folder)
-        except Exception as e:  # noqa: BLE001
-            self.statusBar().showMessage('打不开文件夹: %s' % e, 5000)
-            return
-        pdfs = sorted(n for n in names
-                      if n.lower().endswith('.pdf')
-                      and os.path.isfile(os.path.join(folder, n)))
-        others = sorted(n for n in names
-                        if os.path.isfile(os.path.join(folder, n))
-                        and not n.lower().endswith('.pdf'))
-        self.lbl_folder.setText(folder)
-        self.lbl_folder.setToolTip(folder)
-        for n in pdfs:
-            self._push(n, os.path.join(folder, n))
-        if others:
-            self.lbl_others.setText(
-                '其他文件 %d 个: %s%s' % (len(others), '、'.join(others[:6]),
-                                     ' …' if len(others) > 6 else ''))
-            self.lbl_others.show()
-        self.refresh_files()
-
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, '选择发票 PDF', CLIP, 'PDF 文件 (*.pdf);;所有文件 (*)')
+            self, '选择发票 PDF', cfg_dir(), 'PDF 文件 (*.pdf);;所有文件 (*)')
+        if paths:
+            SETTINGS.setValue('invoice_dir',
+                              os.path.dirname(os.path.abspath(paths[0])))
+            SETTINGS.sync()
         self.add_paths(paths, join=True)
 
     def add_paths(self, paths, join=True):
-        for p in paths:
-            if p.lower().endswith('.pdf') and os.path.isfile(p):
-                self._push(os.path.basename(p), p, join)
-        self.refresh_files()
+        self._batch_begin()
+        try:
+            for p in paths:
+                if p.lower().endswith('.pdf') and os.path.isfile(p):
+                    self._push(os.path.basename(p), p, join)
+        finally:
+            self._batch_end()
 
     def _push(self, name, path, join=False):
         exist = next((f for f in self.files if f['path'] == path), None)
@@ -714,6 +1369,8 @@ class MainWindow(QMainWindow):
         return next((f for f in self.files if f['id'] == fid), None)
 
     def refresh_files(self):
+        if self._suspend:
+            return
         cur = None
         f_cur = self.by_id(self._cur_id)
         if f_cur:
@@ -776,6 +1433,7 @@ class MainWindow(QMainWindow):
             self.file_table.setCellWidget(r, 3, box)
 
         self.lbl_cnt.setText('%d 个' % len(self.files))
+        self.file_table.set_empty(not self.files)
 
     # ---------- 加入 / 移出 / 删除 ----------
     def join_by_id(self, fid):
@@ -810,18 +1468,48 @@ class MainWindow(QMainWindow):
         self._pool.start(task)
 
     def _on_parsed(self, path, inv):
+        hit = None
         for f in self.files:
             if f['path'] == path:
                 f['parsing'] = False
                 f['inv'] = inv
                 f['inReimb'] = True
+                hit = f
                 break
+        if hit:
+            self._hist_add(hit)      # 只保存加入报销的 -> 历史
+        self._queue_refresh()
+
+    # ---------- 批量刷新闸: 一次操作只重建一次表格 ----------
+    def _batch_begin(self):
+        self._suspend += 1
+
+    def _batch_end(self):
+        self._suspend = max(0, self._suspend - 1)
+        if self._suspend == 0:
+            self.refresh_files()
+            self.refresh_detail()
+
+    def _queue_refresh(self):
+        """解析连续完成时合并界面刷新, 避免一次性加载多张 PDF 卡顿。"""
+        if self._suspend:
+            return
+        if not self._defer.isActive():
+            self._defer.start()
+
+    def _deferred_refresh(self):
+        if self._suspend:
+            return
         self.refresh_files()
         self.refresh_detail()
 
     def join_all(self):
-        for f in list(self.files):
-            self.join(f)
+        self._batch_begin()
+        try:
+            for f in list(self.files):
+                self.join(f)
+        finally:
+            self._batch_end()
 
     def leave_all(self):
         for f in self.files:
@@ -829,13 +1517,34 @@ class MainWindow(QMainWindow):
         self.refresh_files()
         self.refresh_detail()
 
+    def remove_all(self):
+        """清空文件列表(只从列表移除, 不动磁盘上的 PDF)。"""
+        if not self.files:
+            return
+        yes = QMessageBox.StandardButton.Yes
+        no = QMessageBox.StandardButton.No
+        if QMessageBox.question(
+                self, '全部删除',
+                '确定把列表中的 %d 个文件全部删除吗?\n(仅从列表移除, 不删除磁盘文件)'
+                % len(self.files),
+                yes | no, no) != yes:
+            return
+        self.files = []
+        self.clear_preview()
+        self.refresh_files()
+        self.refresh_detail()
+
     def join_rows(self, rows):
-        for r in rows:
-            it = self.file_table.item(r, 0)
-            if it:
-                f = self.by_id(it.data(Qt.ItemDataRole.UserRole))
-                if f:
-                    self.join(f)
+        self._batch_begin()
+        try:
+            for r in rows:
+                it = self.file_table.item(r, 0)
+                if it:
+                    f = self.by_id(it.data(Qt.ItemDataRole.UserRole))
+                    if f:
+                        self.join(f)
+        finally:
+            self._batch_end()
 
     # =================================================================
     #  预览
@@ -849,10 +1558,16 @@ class MainWindow(QMainWindow):
 
     def preview(self, f):
         self._cur_id = f['id']
-        self.lbl_pvname.setText(f['name'])
+        self.lbl_pvfile.setText('📄 ' + _elide_name(f['name']))
+        self.lbl_pvfile.setToolTip(f['path'])
         ok = self.pdf_view.load(f['path'])
-        if not ok:
-            self.pdf_view.hint = '无法打开该文件'
+        self.pdf_view.set_warn(not ok)
+        if ok:
+            self.lbl_pvfile.setStyleSheet('')
+        else:
+            self.lbl_pvfile.setStyleSheet('color:#ff6b6b; font-weight:bold;')
+            self.pdf_view.hint = ('打不开这个文件\n'
+                                  '请确认它是可以正常读取的 PDF')
             self.pdf_view.viewport().update()
         self._on_zoom(1.0)
         self.refresh_files()
@@ -860,7 +1575,9 @@ class MainWindow(QMainWindow):
     def clear_preview(self):
         self._cur_id = None
         self.pdf_view.clear()
-        self.lbl_pvname.setText('发票原件')
+        self.lbl_pvfile.setText('')
+        self.lbl_pvfile.setStyleSheet('')
+        self.pdf_view.set_warn(False)
         self.pdf_view.hint = ('单击左侧文件，在这里查看发票原件\n'
                               '滚轮缩放 · 按住左键拖动 · 滑块调缩放')
         self.pdf_view.viewport().update()
@@ -878,9 +1595,27 @@ class MainWindow(QMainWindow):
             for it in (f.get('inv') or {}).get('明细', []):
                 row = dict(it)
                 row['src'] = f['name']
+                row['fid'] = f['id']      # 带上文件 id, 明细行点击能直接跳原件
                 row['inv'] = f['inv']
+                if self.price_incl:
+                    self._to_tax_inclusive(row)
                 out.append(row)
         return out
+
+    @staticmethod
+    def _to_tax_inclusive(row):
+        """'金额'按含税价处理: 不含税 = 含税价÷(1+税率), 税额 = 含税价−不含税。"""
+        base = row.get('金额')
+        if base is None:
+            return row
+        rate = _rate_num(row.get('税率'))
+        net = round(base / (1.0 + rate), 2) if rate > 0 else round(base, 2)
+        row['金额'] = net
+        row['税额'] = round(base - net, 2)
+        p = row.get('单价')
+        if p is not None and rate > 0:
+            row['单价'] = round(p / (1.0 + rate), 4)
+        return row
 
     def rows_grouped(self):
         m = {}
@@ -889,7 +1624,7 @@ class MainWindow(QMainWindow):
             if k not in m:
                 m[k] = {'名称': r.get('名称'), '规格': '', '数量': 0, '单价': None,
                         '金额': 0, '税率': r.get('税率'), '税额': 0,
-                        'src': r.get('src'), 'n': 0}
+                        'src': r.get('src'), 'fid': r.get('fid'), 'n': 0}
             g = m[k]
             g['金额'] = round(g['金额'] + (r.get('金额') or 0), 2)
             g['税额'] = round(g['税额'] + (r.get('税额') or 0), 2)
@@ -904,6 +1639,8 @@ class MainWindow(QMainWindow):
         return sorted(m.values(), key=lambda x: -x['金额'])
 
     def refresh_detail(self):
+        if self._suspend:
+            return
         rows = self.rows_grouped() if self._by_item else self.rows_flat()
         self.detail_table.setRowCount(0)
         for r in rows:
@@ -923,6 +1660,9 @@ class MainWindow(QMainWindow):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if neg and c == 4:
                     it.setForeground(QBrush(QColor('#cf222e')))
+                if c == 0:
+                    it.setData(Qt.ItemDataRole.UserRole, r.get('fid'))
+                    it.setToolTip('点击这一行, 右上角显示这张发票的原件')
                 if c == 8:
                     it.setForeground(QBrush(QColor('#8a9199')))
                     it.setToolTip('点击查看原件')
@@ -930,13 +1670,25 @@ class MainWindow(QMainWindow):
 
         amt = tax = tot = 0.0
         n = 0
-        for f in self.reimb_files():
-            inv = f.get('inv')
-            if inv and inv.get('价税合计') is not None:
-                amt += inv.get('金额') or 0
-                tax += inv.get('税额') or 0
-                tot += inv['价税合计']
-                n += 1
+        if self.price_incl:
+            # 价格含税: 明细金额=含税价, 反推后的不含税金额/税额即为口径
+            for r in self.rows_flat():
+                if r.get('金额') is not None:
+                    amt += r['金额']
+                if r.get('税额') is not None:
+                    tax += r['税额']
+            amt, tax = round(amt, 2), round(tax, 2)
+            tot = round(amt + tax, 2)
+            n = sum(1 for f in self.reimb_files()
+                    if f.get('inv') and f['inv'].get('价税合计') is not None)
+        else:
+            for f in self.reimb_files():
+                inv = f.get('inv')
+                if inv and inv.get('价税合计') is not None:
+                    amt += inv.get('金额') or 0
+                    tax += inv.get('税额') or 0
+                    tot += inv['价税合计']
+                    n += 1
         self.kpis['tAmt'].setText('%.2f' % amt)
         self.kpis['tTax'].setText('%.2f' % tax)
         self.kpis['tTot'].setText('%.2f' % tot)
@@ -961,14 +1713,42 @@ class MainWindow(QMainWindow):
                 self.detail_table.setItem(rr, c, it)
 
     def _detail_clicked(self, row, col):
-        if col != 8:
-            return
-        it = self.detail_table.item(row, 8)
+        """明细里点任意一格 -> 右上角显示这条商品所在发票的原件。"""
+        it = self.detail_table.item(row, 0)
         if not it:
             return
-        f = next((x for x in self.files if x['name'] == it.text()), None)
+        fid = it.data(Qt.ItemDataRole.UserRole)
+        f = self.by_id(fid) if fid else None
+        if f is None and col == 8:
+            # 兜底: 旧行为按“来源”列的文件名匹配
+            s = self.detail_table.item(row, 8)
+            name = s.text() if s else ''
+            f = next((x for x in self.files if x['name'] == name), None)
         if f:
             self.preview(f)
+
+    def toggle_price_incl(self):
+        self.set_price_incl(not self.price_incl)
+
+    def set_price_incl(self, on):
+        """价格口径切换: 默认不含税; 打开后按含税价反推金额/税额。"""
+        on = bool(on)
+        changed = on != self.price_incl
+        self.price_incl = on
+        SETTINGS.setValue('price_incl', '1' if on else '0')
+        SETTINGS.sync()
+        self._sync_incl_btn()
+        if changed:
+            self.refresh_detail()
+            self.statusBar().showMessage(
+                '价格口径: %s' % ('含税价(按税率反推不含税金额与税额)'
+                                  if on else '不含税'), 4000)
+
+    def _sync_incl_btn(self):
+        self.btn_incl.setStyleSheet(
+            'background:#1f6feb; color:#fff; border:none; border-radius:7px; '
+            'padding:6px 13px;' if self.price_incl else '')
+        self.btn_incl.setText('价格含税 ✓' if self.price_incl else '价格含税')
 
     def toggle_byitem(self):
         self._by_item = not self._by_item
@@ -989,11 +1769,15 @@ class MainWindow(QMainWindow):
         if not rows:
             self.statusBar().showMessage('还没有加入报销的发票', 4000)
             return
-        default = '报销商品明细_%s.csv' % datetime.date.today().isoformat()
+        default = os.path.join(
+            cfg_outdir(),
+            '报销商品明细_%s.csv' % datetime.date.today().isoformat())
         path, _ = QFileDialog.getSaveFileName(self, '导出 CSV', default,
                                               'CSV 文件 (*.csv)')
         if not path:
             return
+        SETTINGS.setValue('out_dir', os.path.dirname(os.path.abspath(path)))
+        SETTINGS.sync()
         head = ['来源文件', '发票号码', '开票日期', '销售方', '商品摘要', '商品名称',
                 '规格型号', '数量', '单价', '金额(不含税)', '税率', '税额',
                 '价税合计', '备注']
@@ -1022,6 +1806,171 @@ class MainWindow(QMainWindow):
                         '%.2f' % ft, '%.2f' % (fa + ft), ''])
         self.statusBar().showMessage('已导出: %s' % path, 6000)
 
+    # =================================================================
+    #  生成 Excel 报告
+    # =================================================================
+    def generate_report(self):
+        rows = self.rows_flat()
+        if not rows:
+            self.statusBar().showMessage('还没有加入报销的发票', 4000)
+            return
+        default = os.path.join(
+            cfg_outdir(),
+            '报销报告_%s.xlsx' % datetime.date.today().isoformat())
+        path, _ = QFileDialog.getSaveFileName(self, '生成报告', default,
+                                              'Excel 工作簿 (*.xlsx)')
+        if not path:
+            return
+        SETTINGS.setValue('out_dir', os.path.dirname(os.path.abspath(path)))
+        SETTINGS.sync()
+        if not path.lower().endswith('.xlsx'):
+            path += '.xlsx'
+        try:
+            self._write_xlsx(path, rows)
+        except ImportError:
+            QMessageBox.warning(self, '缺少组件',
+                                '生成 Excel 报告需要 openpyxl。\n'
+                                '请先安装: pip install openpyxl')
+            return
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, '生成失败', '写出报告时出错:\n%s' % e)
+            return
+        self.statusBar().showMessage('已生成报告: %s' % path, 8000)
+
+    @staticmethod
+    def _sheet_table(ws, header, widths, rows, num_cols=(), start=1):
+        """写一张带样式的表: 蓝底白字表头 + 细边框 + 自动列宽。"""
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+
+        fill = PatternFill('solid', fgColor='1F6FEB')
+        hfont = Font(name='微软雅黑', size=11, bold=True, color='FFFFFF')
+        cfont = Font(name='微软雅黑', size=11)
+        side = Side(style='thin', color='DDE2E8')
+        bd = Border(left=side, right=side, top=side, bottom=side)
+        halign = Alignment(horizontal='center', vertical='center')
+        ralign = Alignment(horizontal='right', vertical='center')
+        lalign = Alignment(horizontal='left', vertical='center')
+
+        r = start
+        for c, name in enumerate(header, 1):
+            cell = ws.cell(row=r, column=c, value=name)
+            cell.fill, cell.font = fill, hfont
+            cell.alignment, cell.border = halign, bd
+        for row in rows:
+            r += 1
+            for c, v in enumerate(row, 1):
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.font, cell.border = cfont, bd
+                if c in num_cols and isinstance(v, (int, float)):
+                    cell.number_format = '#,##0.00'
+                    cell.alignment = ralign
+                else:
+                    cell.alignment = lalign if c == 1 else halign
+        for c, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        return r
+
+    def _write_xlsx(self, path, rows):
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font
+
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        files = self.reimb_files()
+        tot_amt = round(sum(r.get('金额') or 0 for r in rows), 2)
+        tot_tax = round(sum(r.get('税额') or 0 for r in rows), 2)
+        tot_all = round(tot_amt + tot_tax, 2)
+
+        wb = Workbook()
+
+        # ---- Sheet 1: 汇总 ----
+        ws = wb.active
+        ws.title = '汇总'
+        ws.sheet_view.showGridLines = False
+        ws.merge_cells('A1:D1')
+        t = ws['A1']
+        t.value = '发票报销报告'
+        t.font = Font(name='微软雅黑', size=18, bold=True, color='1F6FEB')
+        t.alignment = Alignment(horizontal='left', vertical='center')
+        ws.row_dimensions[1].height = 30
+        ws['A2'] = '生成时间: %s' % now
+        ws['A2'].font = Font(name='微软雅黑', size=10, color='8A9199')
+        self._sheet_table(
+            ws, ['项目', '数值'], [22, 16],
+            [['金额(不含税)', tot_amt], ['税额', tot_tax],
+             ['价税合计', tot_all],
+             ['发票张数', len(files)], ['明细行数', len(rows)]],
+            num_cols=(2,), start=4)
+        ws['A11'] = '本表由发票助手自动生成, 数据来源于所选发票 PDF 的本地解析。'
+        ws['A11'].font = Font(name='微软雅黑', size=10, color='8A9199')
+
+        # ---- Sheet 2: 发票清单 ----
+        ws2 = wb.create_sheet('发票清单')
+        ws2.sheet_view.showGridLines = False
+        inv_rows = []
+        for i, f in enumerate(files, 1):
+            v = f.get('inv') or {}
+            inv_rows.append([
+                i, f['name'], v.get('发票号码', ''), v.get('开票日期', ''),
+                v.get('销售方', ''),
+                v.get('金额'), v.get('税额'), v.get('价税合计'),
+                v.get('备注', ''),
+            ])
+        inv_rows.append(['合计', '', '', '', '', tot_amt, tot_tax, tot_all, ''])
+        last = self._sheet_table(
+            ws2, ['序号', '文件名', '发票号码', '开票日期', '销售方',
+                  '金额(不含税)', '税额', '价税合计', '备注'],
+            [6, 30, 20, 13, 34, 14, 12, 13, 24],
+            inv_rows, num_cols=(6, 7, 8))
+        for c in range(1, 10):
+            ws2.cell(row=last, column=c).font = Font(
+                name='微软雅黑', size=11, bold=True)
+        ws2.freeze_panes = 'A2'
+
+        # ---- Sheet 3: 商品明细 ----
+        ws3 = wb.create_sheet('商品明细')
+        ws3.sheet_view.showGridLines = False
+        det = []
+        for r in rows:
+            has = r.get('金额') is not None and r.get('税额') is not None
+            det.append([
+                r['src'], r.get('名称'), r.get('规格'),
+                r.get('数量'), r.get('单价'), r.get('金额'),
+                r.get('税率'), r.get('税额'),
+                (round(r['金额'] + r['税额'], 2) if has else None),
+            ])
+        det.append(['合计', '', '', '', '', tot_amt, '', tot_tax, tot_all])
+        last = self._sheet_table(
+            ws3, ['来源文件', '商品名称', '规格型号', '数量', '单价',
+                  '金额(不含税)', '税率', '税额', '价税合计'],
+            [30, 30, 30, 9, 11, 14, 9, 11, 13],
+            det, num_cols=(5, 6, 8, 9))
+        for c in range(1, 10):
+            ws3.cell(row=last, column=c).font = Font(
+                name='微软雅黑', size=11, bold=True)
+        ws3.freeze_panes = 'A2'
+
+        # ---- Sheet 4: 按商品汇总 ----
+        ws4 = wb.create_sheet('按商品汇总')
+        ws4.sheet_view.showGridLines = False
+        grp = self.rows_grouped()
+        grp_rows = [[g.get('名称'), g.get('规格'), g.get('数量'),
+                     g.get('金额'), g.get('税额'),
+                     round((g.get('金额') or 0) + (g.get('税额') or 0), 2),
+                     g.get('n')] for g in grp]
+        grp_rows.append(['合计', '', '', tot_amt, tot_tax, tot_all, len(rows)])
+        last = self._sheet_table(
+            ws4, ['商品名称', '规格型号', '数量', '金额(不含税)', '税额',
+                  '价税合计', '出现次数'],
+            [34, 30, 10, 14, 12, 13, 11],
+            grp_rows, num_cols=(4, 5, 6))
+        for c in range(1, 8):
+            ws4.cell(row=last, column=c).font = Font(
+                name='微软雅黑', size=11, bold=True)
+        ws4.freeze_panes = 'A2'
+
+        wb.save(path)
+
 
 # ======================================================================
 #  样式
@@ -1031,24 +1980,58 @@ QSS = """
 QMainWindow { background: #eef1f6; }
 QWidget { background: transparent; color: #24292f; }
 QFrame#header { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-    stop:0 #1f6feb, stop:1 #3a86ff); }
+    stop:0 #1f6feb, stop:1 #3a86ff);
+    border-bottom: 1px solid rgba(0,0,0,24); }
 QLabel#title { color: #fff; font-size: 16px; font-weight: bold; background: transparent; }
 QLabel#folder { color: #fff; font-size: 12px; background: rgba(255,255,255,45);
     border-radius: 10px; padding: 3px 10px; }
 QLabel#sum { color: #fff; font-size: 13px; background: rgba(255,255,255,42);
     border-radius: 10px; padding: 5px 14px; }
+QLabel#headtip { color: rgba(255,255,255,175); font-size: 12px;
+    background: transparent; }
+QPushButton#gear { background: rgba(255,255,255,54); border: none;
+    border-radius: 15px; color: #fff; font-size: 15px; padding: 0; }
+QPushButton#gear:hover { background: rgba(255,255,255,110); }
+QPushButton#gear:pressed { background: rgba(0,0,0,45); }
+QPushButton#headbtn { background: rgba(255,255,255,44); color: #fff;
+    border: 1px solid rgba(255,255,255,110); border-radius: 7px;
+    padding: 5px 13px; font-size: 13px; min-height: 18px; }
+QPushButton#headbtn:hover { background: rgba(255,255,255,88); }
+QPushButton#headbtn:checked { background: #fff; color: #1f6feb;
+    border-color: #fff; font-weight: bold; }
+QDialog#settings { background: #ffffff; }
+QDialog { background: #ffffff; }
+QMessageBox { background: #ffffff; }
+QMessageBox QLabel { color: #24292f; background: transparent;
+    font-size: 13px; }
+QMessageBox QLabel#titleBarLabel { font-weight: bold; }
+QLabel#dlgTitle { font-size: 16px; font-weight: bold; color: #1c2430;
+    background: transparent; }
+QLineEdit { background: #fff; color: #24292f; border: 1px solid #d7dee7;
+    border-radius: 6px; padding: 6px 9px; selection-background-color: #1f6feb; }
+QLineEdit:focus { border-color: #1f6feb; }
 QFrame#panel { background: #fff; border: 1px solid #e3e8ef; border-radius: 10px; }
 QLabel#panelTitle { font-size: 14px; font-weight: bold; color: #1c2430;
     background: transparent; }
 QLabel#tip { color: #8a9199; font-size: 12px; background: transparent; }
+QLabel#subhead { color: #57606a; font-size: 12px; font-weight: bold;
+    background: transparent; }
+QListWidget#histdays { background: #fff; border: 1px solid #e3e8ef;
+    border-radius: 9px; padding: 4px; outline: none; font-size: 13px; }
+QListWidget#histdays::item { padding: 8px 9px; border-radius: 7px;
+    color: #24292f; }
+QListWidget#histdays::item:hover { background: #f2f7ff; }
+QListWidget#histdays::item:selected { background: #1f6feb; color: #fff; }
+QTableWidget#histitems { border: 1px solid #e3e8ef; border-radius: 9px; }
 QLabel#badge { color: #8a9199; font-size: 12px; background: #f1f4f8;
     border-radius: 9px; padding: 2px 9px; }
 QLabel#others { color: #9aa0a6; font-size: 11px; border-top: 1px dashed #edf0f4; }
 QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
     stop:0 #2f7dff, stop:1 #1f6feb); color: #fff; border: none;
-    border-radius: 7px; padding: 6px 13px; }
+    border-radius: 7px; padding: 6px 13px; min-height: 20px; }
 QPushButton:hover { background: #3a86ff; }
 QPushButton:pressed { background: #1a5fd0; }
+QPushButton:focus { outline: none; }
 QPushButton#ghost { background: #fff; color: #33404f; border: 1px solid #d7dee7; }
 QPushButton#ghost:hover { background: #f3f7ff; border-color: #9dc0ff; }
 QPushButton#tiny { padding: 3px 9px; border-radius: 6px; }
@@ -1061,21 +2044,25 @@ QPushButton#del:hover { background: #ffe9e6; color: #cf222e; }
 QTableWidget { background: #fff; alternate-background-color: #fafbfd;
     border: none; gridline-color: #f1f3f6; font-size: 13px; }
 QTableWidget::item { padding: 4px; }
+QTableWidget::item:hover { background: #f2f7ff; }
 QTableWidget::item:selected { background: #eaf2ff; color: #24292f; }
-QHeaderView::section { background: #f7f9fc; color: #57606a; font-size: 12px;
-    border: none; border-bottom: 1px solid #e6ebf2; padding: 7px; }
-QScrollBar:vertical { background: transparent; width: 12px; margin: 0; }
-QScrollBar::handle:vertical { background: #c3ccd9; border-radius: 6px;
+QHeaderView::section { background: #f7f9fc; color: #444c56; font-size: 12px;
+    font-weight: bold; border: none; border-bottom: 1px solid #e6ebf2;
+    padding: 7px; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #ccd5e0; border-radius: 5px;
     min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: #a7b3c4; }
-QScrollBar:horizontal { background: transparent; height: 12px; margin: 0; }
-QScrollBar::handle:horizontal { background: #c3ccd9; border-radius: 6px;
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #ccd5e0; border-radius: 5px;
     min-width: 30px; }
 QScrollBar::handle:horizontal:hover { background: #a7b3c4; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QFrame#pvbar { background: #fbfcfe; border-bottom: 1px solid #edf0f4; }
 QLabel#pvname { font-weight: bold; color: #33404f; background: transparent; }
+QLabel#pvfile { color: #57606a; font-size: 12px; background: transparent;
+    padding: 2px 6px; }
 QLabel#zoomval { color: #1f6feb; background: #eaf2ff; border-radius: 9px;
     padding: 2px 4px; min-width: 48px; }
 QSlider::groove:horizontal { height: 5px; border-radius: 5px; background: #dde3ea; }
@@ -1083,6 +2070,7 @@ QSlider::sub-page:horizontal { background: #1f6feb; border-radius: 5px; }
 QSlider::handle:horizontal { background: #fff; border: 2px solid #1f6feb;
     width: 14px; height: 14px; border-radius: 8px; margin: -6px 0; }
 QLabel#pvempty { color: #aeb4bc; font-size: 14px; background: transparent; }
+QLabel#filehint { color: #aeb4bc; font-size: 13px; background: transparent; }
 QFrame#detailbar { background: #fbfcfe; border-bottom: 1px solid #edf0f4; }
 QFrame#kpiwrap { background: #f7f9fc; border-bottom: 1px solid #edf0f4; }
 QFrame#kpi { background: #fff; border: 1px solid #e6ebf2; border-radius: 8px; }
@@ -1096,9 +2084,193 @@ QStatusBar { background: #f7f9fc; color: #57606a; }
 """
 
 
+# ======================================================================
+#  开机动画: 大 ¥ 先压缩再弹开(~3s), 期间后台预加载解析模块
+# ======================================================================
+class Splash(QWidget):
+    finished = Signal()
+    DURATION = 3.0       # 动画总时长(秒)
+    FADE = 0.28          # 淡入/淡出时长(秒)
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(460, 470)
+        scr = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(scr.x() + (scr.width() - 460) // 2,
+                  scr.y() + (scr.height() - 470) // 2)
+        self._t0 = _time.perf_counter()
+        self._t = 0.0
+        self._closing = False
+        self._close_t = 0.0
+        self._emitted = False
+        self._skip = False        # 单击跳过动画
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    # ---------- 生命周期 ----------
+    def start(self):
+        self._t0 = _time.perf_counter()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._timer.start()
+
+    @property
+    def elapsed(self):
+        return self._t
+
+    @property
+    def skipped(self):
+        return self._skip
+
+    def skip(self):
+        """单击/回车/空格 -> 立刻结束动画, 进度条打满。"""
+        if self._emitted or self._closing:
+            return
+        self._skip = True
+        self._emitted = True
+        # 把时间轴整体前移到 DURATION: 之后每帧都从结束点继续, 淡出也能正常收尾
+        self._t = self.DURATION
+        self._t0 = _time.perf_counter() - self.DURATION
+        self.finished.emit()
+        self.update()
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.skip()
+        super().mousePressEvent(ev)
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter,
+                        Qt.Key.Key_Space, Qt.Key.Key_Escape):
+            self.skip()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def begin_close(self):
+        if not self._closing:
+            self._closing = True
+            self._close_t = self._t
+
+    def _tick(self):
+        self._t = _time.perf_counter() - self._t0
+        if not self._emitted and self._t >= self.DURATION:
+            self._emitted = True
+            self.finished.emit()
+        if self._closing and self._t - self._close_t >= self.FADE:
+            self._timer.stop()
+            self.close()
+            self.deleteLater()
+            return
+        self.update()
+
+    # ---------- 动画曲线 ----------
+    @staticmethod
+    def _smooth(k):
+        k = max(0.0, min(1.0, k))
+        return k * k * (3 - 2 * k)
+
+    @staticmethod
+    def _spring(u, amp, lam=2.2, w=5.5):
+        """带阻尼的弹簧: u=0 时等于 1+amp, 初速度为 0, 平滑回落到 1。"""
+        if u <= 0:
+            return 1.0 + amp
+        c = lam * amp / w          # 让 u=0 处一阶导为 0, 接缝处不折
+        return 1.0 + math.exp(-lam * u) * (amp * math.cos(w * u)
+                                           + c * math.sin(w * u))
+
+    def _scale(self):
+        """返回 (横向, 纵向): 快速压扁 → 阻尼回弹(带一点过冲) → 静止。"""
+        t = self._t
+        T = 0.55                                  # 压缩阶段
+        if t < T:
+            k = self._smooth(t / T)               # ease-in-out, 收尾零速度
+            return 1.0 + 0.22 * k, 1.0 - 0.40 * k
+        u = t - T
+        return self._spring(u, 0.22), self._spring(u, -0.40)
+
+    def _alpha(self):
+        if self._closing:
+            return max(0.0, 1.0 - (self._t - self._close_t) / self.FADE)
+        return min(1.0, self._t / self.FADE)
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, ev):
+        a = self._alpha()
+        if a <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(a)
+
+        # 卡片 + 阴影
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(15, 30, 60, 46))
+        p.drawRoundedRect(QRectF(12, 18, 440, 444), 26, 26)
+        p.setPen(QPen(QColor('#e3e8ef'), 1.6))
+        p.setBrush(QColor('#ffffff'))
+        p.drawRoundedRect(QRectF(8, 10, 440, 444), 26, 26)
+
+        # 大 ¥(压缩/展开就是它在变形)
+        sx, sy = self._scale()
+        p.save()
+        p.translate(228, 216)
+        p.scale(sx, sy)
+        p.setPen(QColor('#1f6feb'))
+        f = QFont()
+        f.setPixelSize(240)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(-170, -160, 340, 320),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   '¥')
+        p.restore()
+
+        # 标题 + 进度条
+        p.setPen(QColor('#57606a'))
+        f2 = QFont()
+        f2.setPixelSize(16)
+        f2.setBold(True)
+        p.setFont(f2)
+        p.drawText(QRectF(8, 372, 440, 26),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   '发票助手')
+        p.setPen(QColor('#8a9199'))
+        f3 = QFont()
+        f3.setPixelSize(12)
+        p.setFont(f3)
+        p.drawText(QRectF(8, 396, 440, 20),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   '本地解析 · 正在准备…')
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor('#e8eef7'))
+        p.drawRoundedRect(QRectF(130, 426, 200, 8), 4, 4)
+        p.setBrush(QColor('#1f6feb'))
+        prog = max(0.0, min(1.0, self._t / self.DURATION))
+        p.drawRoundedRect(QRectF(130, 426, 200 * prog, 8), 4, 4)
+
+        # 单击跳过提示
+        if 0.6 < self._t < self.DURATION:
+            p.setPen(QColor('#b1b6bb'))
+            f4 = QFont()
+            f4.setPixelSize(11)
+            p.setFont(f4)
+            p.drawText(QRectF(8, 436, 440, 16),
+                       Qt.AlignmentFlag.AlignHCenter
+                       | Qt.AlignmentFlag.AlignVCenter,
+                       '单击跳过')
+        p.end()
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('发票助手')
+    app.setWindowIcon(MainWindow._make_icon())
     f = app.font()
     f.setFamilies(['Microsoft YaHei UI', 'Microsoft YaHei'])
     f.setPixelSize(13)
@@ -1106,8 +2278,52 @@ def main():
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(f)
     app.setStyleSheet(QSS)
-    win = MainWindow()
-    win.show()
+
+    bench = bool(os.environ.get('FAPIAO_BENCH'))
+
+    # 1) 立刻弹开机动画
+    splash = Splash()
+    splash.start()
+
+    # 2) 动画播放的同时后台预加载解析模块(PDF 渲染/解析引擎)
+    ready = {'done': False}
+
+    def _preload():
+        try:
+            import fitz  # noqa: F401
+            import 发票解析  # noqa: F401
+        except Exception:  # noqa: BLE001
+            pass
+        ready['done'] = True
+
+    threading.Thread(target=_preload, daemon=True).start()
+
+    # 3) 动画放完 且 预加载完成 -> 建主窗口; 最多等 8s 兜底
+    box = {'win': None}
+    poll = QTimer()
+    poll.setInterval(80)
+
+    def _poll():
+        waited = _time.perf_counter() - _T0
+        # 动画放完(或用户单击跳过) 且 预加载完成 -> 建主窗口; 最多等 8s 兜底
+        anim_done = splash.skipped or splash.elapsed >= Splash.DURATION
+        load_done = ready['done'] or splash.skipped
+        if box['win'] is None and anim_done and (load_done or waited > 8.0):
+            box['win'] = MainWindow()
+            box['win'].show()
+            splash.begin_close()
+            if bench:
+                print('startup: window %.3f s (preload %s)'
+                      % (waited, ready['done']), flush=True)
+                QTimer.singleShot(
+                    400, lambda: print('startup: ready %.3f s'
+                                       % (_time.perf_counter() - _T0),
+                                       flush=True))
+            poll.stop()
+
+    poll.timeout.connect(_poll)
+    poll.start()
+
     sys.exit(app.exec())
 
 

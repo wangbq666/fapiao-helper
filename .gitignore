@@ -1,9 +1,13 @@
 # 打包产物 (exe 走 GitHub Release, 不进仓库)
 build/
-buildqt/
 dist/
 distqt/
+buildqt/*
 *.spec
+
+# 打包配置跟着源码走, 换台机器也能直接打包
+!buildqt/发票助手Qt.spec
+!buildqt/fapiao.ico
 
 # 运行时生成
 __pycache__/
@@ -14,3 +18,9 @@ _files/
 *.lnk
 发票统计_*.csv
 报销商品明细_*.csv
+
+# 隐私兜底: 发票 PDF 和导出的表格一律不进仓库
+*.pdf
+*.csv
+*.xlsx
+*.xls
