@@ -14,6 +14,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time as _time
@@ -25,13 +26,15 @@ def _fitz():
     import fitz as _m
     return _m
 
-from PySide6.QtCore import (QObject, QMimeData, QRectF, QRunnable, Qt,
+from PySide6.QtCore import (QEasingCurve, QObject, QMimeData, QPointF,
+                            QPropertyAnimation, QRectF, QRunnable, Qt,
                             QSettings, QThreadPool, QTimer, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QGuiApplication, QIcon,
-                           QImage, QPainter, QPen, QPixmap)
+                           QImage, QKeySequence, QPainter, QPainterPath, QPen,
+                           QPixmap, QShortcut)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog,
-    QFormLayout, QFrame, QGraphicsScene,
+    QFormLayout, QFrame, QGraphicsOpacityEffect, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsView, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QSlider, QSplitter, QStackedWidget, QTableWidget,
@@ -44,7 +47,45 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 MIME_ROWS = 'application/x-invoice-rows'
 
 # ---------------- 本机设置(只存本地, 不联网) ----------------
-SETTINGS = QSettings('FapiaoHelper', 'FapiaoHelper')
+# 测试可设 FAPIAO_SETTINGS=<ini路径> 把设置重定向, 避免污染本机注册表
+SETTINGS = (QSettings(os.environ['FAPIAO_SETTINGS'],
+                      QSettings.Format.IniFormat)
+            if os.environ.get('FAPIAO_SETTINGS')
+            else QSettings('FapiaoHelper', 'FapiaoHelper'))
+
+# ---------------- 主题(浅色/深色) ----------------
+THEMES = {
+    'light': {
+        'selRow': '#eaf2ff', 'totalRow': '#fffdf3', 'green': '#1a7f37',
+        'red': '#cf222e', 'warn': '#9a6700', 'gray': '#8a9199',
+        'dim': '#b1b6bb', 'accent': '#1f6feb', 'pvbg': '#33383f',
+    },
+    'dark': {
+        'selRow': '#1f3a5f', 'totalRow': '#2a3040', 'green': '#3fb950',
+        'red': '#f85149', 'warn': '#d29922', 'gray': '#8b949e',
+        'dim': '#6e7681', 'accent': '#4493f8', 'pvbg': '#12151a',
+    },
+}
+THEME = THEMES['light']
+
+
+def _cfg_dark():
+    return str(SETTINGS.value('dark', '0')) in ('1', 'true', 'True')
+
+
+# ---------------- 报销清单持久化(重启恢复当前报销) ----------------
+def session_save(paths):
+    if os.environ.get('FAPIAO_NO_SESSION'):
+        return
+    SETTINGS.setValue('reimb_paths', '\n'.join(paths))
+    SETTINGS.sync()
+
+
+def session_load():
+    if os.environ.get('FAPIAO_NO_SESSION'):
+        return []
+    v = SETTINGS.value('reimb_paths', '') or ''
+    return [p for p in str(v).split('\n') if p]
 
 
 def _dl_dir():
@@ -259,8 +300,133 @@ def _placeholder_pixmap():
 
 
 # ======================================================================
-#  PDF 预览视图: 滚轮缩放 / 按住拖动 / 原生滚动条 / 高清重渲染
+#  图标工厂: 全部 QPainter 手绘(不同 Windows 版本上 emoji 渲染不一致)
 # ======================================================================
+def _icon(kind, size=18, color='#8a9199'):
+    img = QImage(size, size, QImage.Format.Format_ARGB32)
+    img.fill(QColor(0, 0, 0, 0))
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    c = QColor(color)
+    pen = QPen(c, max(1.4, size * 0.08))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    s = float(size)
+
+    def bars(x0, y0, w, h, r=1.5):
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(x0, y0, w, h), r, r)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind == 'doc':                    # 单页文档 + 文字行
+        r = QRectF(s * 0.16, s * 0.10, s * 0.68, s * 0.80)
+        p.drawRoundedRect(r, s * 0.10, s * 0.10)
+        for k, fy in enumerate((0.32, 0.52, 0.72)):
+            y = r.y() + r.height() * fy
+            p.drawLine(QPointF(r.x() + r.width() * 0.22, y),
+                       QPointF(r.x() + r.width() * (0.72 if k < 2 else 0.78), y))
+    elif kind == 'receipt':              # 锯齿底边小票
+        path = QPainterPath()
+        x0, y0, w, h = s * 0.20, s * 0.12, s * 0.60, s * 0.76
+        path.moveTo(x0, y0)
+        path.lineTo(x0 + w, y0)
+        path.lineTo(x0 + w, y0 + h - s * 0.10)
+        zig = w / 4
+        for i in range(4):
+            path.lineTo(x0 + w - zig * (i + 0.5), y0 + h)
+            path.lineTo(x0 + w - zig * (i + 1), y0 + h - s * 0.10)
+        path.closeSubpath()
+        p.drawPath(path)
+        for fy in (0.36, 0.56):
+            p.drawLine(QPointF(x0 + w * 0.25, y0 + h * fy),
+                       QPointF(x0 + w * 0.75, y0 + h * fy))
+    elif kind == 'clock':
+        p.drawEllipse(QRectF(s * 0.14, s * 0.14, s * 0.72, s * 0.72))
+        p.drawLine(QPointF(s * 0.50, s * 0.30), QPointF(s * 0.50, s * 0.52))
+        p.drawLine(QPointF(s * 0.50, s * 0.52), QPointF(s * 0.66, s * 0.62))
+    elif kind == 'gear':                 # 滑杆式设置图标(比齿轮好画)
+        for i, fy in enumerate((0.28, 0.50, 0.72)):
+            y = s * fy
+            p.drawLine(QPointF(s * 0.18, y), QPointF(s * 0.82, y))
+            kx = (0.62, 0.34, 0.66)[i]
+            bars(s * kx - s * 0.09, y - s * 0.09, s * 0.18, s * 0.18, s * 0.09)
+    elif kind == 'moon':
+        path = QPainterPath()
+        path.addEllipse(QRectF(s * 0.16, s * 0.10, s * 0.74, s * 0.74))
+        path.addEllipse(QRectF(s * 0.36, s * 0.00, s * 0.68, s * 0.80))
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawPath(path)
+    elif kind == 'sun':
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QRectF(s * 0.32, s * 0.32, s * 0.36, s * 0.36))
+        p.setPen(pen)
+        for a in range(8):
+            rad = math.pi / 4 * a
+            p.drawLine(QPointF(s * 0.5 + math.cos(rad) * s * 0.30,
+                               s * 0.5 + math.sin(rad) * s * 0.30),
+                       QPointF(s * 0.5 + math.cos(rad) * s * 0.42,
+                               s * 0.5 + math.sin(rad) * s * 0.42))
+    elif kind == 'plus':
+        p.drawLine(QPointF(s * 0.5, s * 0.20), QPointF(s * 0.5, s * 0.80))
+        p.drawLine(QPointF(s * 0.20, s * 0.5), QPointF(s * 0.80, s * 0.5))
+    elif kind == 'search':
+        p.drawEllipse(QRectF(s * 0.16, s * 0.16, s * 0.46, s * 0.46))
+        p.drawLine(QPointF(s * 0.58, s * 0.58), QPointF(s * 0.82, s * 0.82))
+    elif kind == 'chart':
+        base = s * 0.82
+        for bx, bh in ((0.20, 0.28), (0.44, 0.50), (0.68, 0.38)):
+            bars(s * bx - s * 0.07, base - s * bh, s * 0.14, s * bh)
+    p.end()
+    return QIcon(QPixmap.fromImage(img))
+
+
+class _SortItem(QTableWidgetItem):
+    """带隐藏排序键的单元格: 表头点击排序时按 key 比, 而不是显示文本。"""
+
+    def __init__(self, text, key=None):
+        super().__init__(text)
+        self._key = key
+
+    def __lt__(self, other):
+        # 注意: 不能调 super().__lt__(), PySide6 上会段错误
+        a = self._key if self._key is not None else self.text()
+        b = getattr(other, '_key', None)
+        if b is None:
+            b = other.text() if hasattr(other, 'text') else ''
+        try:
+            return a < b
+        except TypeError:
+            return str(a) < str(b)
+
+
+# ======================================================================
+#  PDF 预览视图: 滚轮缩放 / 按住拖动 / 原生滚动条 / 高清重渲染
+#  (文档句柄常驻复用; 重渲染走后台线程, 只重画视口内的页)
+# ======================================================================
+class RenderSignals(QObject):
+    done = Signal(str, int, float, QImage)      # path, pageIdx, scale, img
+
+
+class RenderTask(QRunnable):
+    """后台渲染一页: 渲染期间 GUI 线程不被阻塞。"""
+
+    def __init__(self, view, path, idx, scale):
+        super().__init__()
+        self.view, self.path, self.idx, self.scale = view, path, idx, scale
+        self.sig = RenderSignals()
+
+    def run(self):
+        img = self.view._render_page(self.idx, self.scale)
+        self.sig.done.emit(self.path, self.idx, self.scale, img)
+
+
 class PDFView(QGraphicsView):
     zoomChanged = Signal(float)
     hasDoc = Signal(bool)
@@ -271,6 +437,9 @@ class PDFView(QGraphicsView):
         self.setScene(self._scene)
         self._pages = []
         self._path = None
+        self._doc = None                 # 常驻文档句柄(避免每次渲染重开文件)
+        self._doc_lock = threading.Lock()
+        self._inflight = set()           # 正在后台渲染的 (idx, scale)
         self._fit = 1.0
         self._zoom = 1.0
         self._panning = False
@@ -306,14 +475,22 @@ class PDFView(QGraphicsView):
         self._rt.setInterval(200)
         self._rt.timeout.connect(self._rerender)
 
+        # 滚动时把新滚进视口的"脏页"补渲染(80ms 去抖)
+        self._vt = QTimer(self)
+        self._vt.setSingleShot(True)
+        self._vt.setInterval(80)
+        self._vt.timeout.connect(self._ensure_visible)
+
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setBackgroundBrush(QColor('#33383f'))
+        self.setBackgroundBrush(QColor(THEME['pvbg']))
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        sb = self.verticalScrollBar()
+        sb.valueChanged.connect(lambda _: self._vt.start())
 
     def set_warn(self, on):
         """打不开文件时显示警告徽标。"""
@@ -365,8 +542,17 @@ class PDFView(QGraphicsView):
 
     # ---------------- 文档 ----------------
     def clear(self):
+        # 先等后台渲染用完句柄再关文档, 避免渲染线程访问已关闭的文档
+        with self._doc_lock:
+            doc, self._doc = self._doc, None
+        if doc:
+            try:
+                doc.close()
+            except Exception:  # noqa: BLE001
+                pass
         self._scene.clear()
         self._pages = []
+        self._inflight.clear()
         self._path = None
         self._zoom = 1.0
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -378,12 +564,13 @@ class PDFView(QGraphicsView):
             fz = _fitz()
             doc = fz.open(path)
             rects = [(p.rect.width, p.rect.height) for p in doc]
-            doc.close()
         except Exception:
             return False
         if not rects:
+            doc.close()
             return False
         self._path = path
+        self._doc = doc                    # 句柄常驻, 重渲染不再重开文件
         self._fit_pending = max(w for w, _ in rects)
         self._compute_fit()
         gap = 14.0
@@ -398,7 +585,8 @@ class PDFView(QGraphicsView):
             item.setPos(0, y)
             item.setScale(1.0 / s0)
             self._scene.addItem(item)
-            self._pages.append({'w': w, 'h': h, 'scale': s0, 'item': item, 'idx': i})
+            self._pages.append({'w': w, 'h': h, 'scale': s0, 'item': item,
+                                'idx': i, 'dirty': False})
             y += h + gap
         if not self._pages:
             return False
@@ -427,14 +615,24 @@ class PDFView(QGraphicsView):
 
     def _render_page(self, idx, scale):
         try:
-            fz = _fitz()
-            doc = fz.open(self._path)
-            pix = doc[idx].get_pixmap(matrix=fz.Matrix(scale, scale))
-            doc.close()
+            with self._doc_lock:
+                if self._doc is None:
+                    return QImage()
+                pix = self._doc[idx].get_pixmap(
+                    matrix=_fitz().Matrix(scale, scale))
             return QImage(pix.samples, pix.width, pix.height, pix.stride,
                           QImage.Format.Format_RGB888).copy()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return QImage()
+
+    def _visible_idx(self):
+        """当前视口能看到的页码集合(只重渲染可见页, 控内存)。"""
+        try:
+            vr = self.mapToScene(self.viewport().rect()).boundingRect()
+        except Exception:  # noqa: BLE001
+            return set(range(len(self._pages)))
+        return {p['idx'] for p in self._pages
+                if p['item'].sceneBoundingRect().intersects(vr)}
 
     def _apply_transform(self):
         self.resetTransform()
@@ -471,18 +669,55 @@ class PDFView(QGraphicsView):
             self._rt.start()
 
     def _rerender(self):
-        if not self._pages or not self._path:
+        """高清重渲染: 可见页投给后台线程, 视口外先标脏, 滚过去再补。"""
+        if not self._pages or self._doc is None:
             return
         target = self._render_scale()
+        vis = self._visible_idx()
         for p in self._pages:
             if abs(p['scale'] - target) < 0.12:
+                p['dirty'] = False
                 continue
-            img = self._render_page(p['idx'], target)
-            if img.isNull():
+            if (p['idx'], round(target, 3)) in self._inflight:
                 continue
+            if p['idx'] not in vis:
+                p['dirty'] = True
+                continue
+            self._start_render(p, target)
+
+    def _start_render(self, p, target):
+        self._inflight.add((p['idx'], round(target, 3)))
+        task = RenderTask(self, self._path, p['idx'], target)
+        task.sig.done.connect(self._on_rendered)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_rendered(self, path, idx, scale, img):
+        self._inflight.discard((idx, round(scale, 3)))
+        if self._doc is None or path != self._path or img.isNull():
+            return
+        p = next((q for q in self._pages if q['idx'] == idx), None)
+        if p is None:
+            return
+        target = self._render_scale()
+        # 只在结果确实比现有贴图更接近目标缩放时才替换
+        if abs(scale - target) <= abs(p['scale'] - target):
             p['item'].setPixmap(QPixmap.fromImage(img))
-            p['item'].setScale(1.0 / target)
-            p['scale'] = target
+            p['item'].setScale(1.0 / scale)
+            p['scale'] = scale
+            p['dirty'] = abs(scale - target) >= 0.12
+        if not self._vt.isActive() and any(q['dirty'] for q in self._pages):
+            self._rt.start()       # 一页画完, 顺带看看还有没有别的可见脏页
+
+    def _ensure_visible(self):
+        """滚动/缩放后补渲染视口内的脏页。"""
+        if not self._pages or self._doc is None:
+            return
+        target = self._render_scale()
+        vis = self._visible_idx()
+        for p in self._pages:
+            if (p['idx'] in vis and p['dirty']
+                    and (p['idx'], round(target, 3)) not in self._inflight):
+                self._start_render(p, target)
 
     # ---------------- 交互 ----------------
     def wheelEvent(self, e):
@@ -532,11 +767,12 @@ class PDFView(QGraphicsView):
 # ======================================================================
 class FileTable(QTableWidget):
     filesDropped = Signal(list)
+    COLS = ['文件', '状态', '金额', '操作']
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(4)
-        self.setHorizontalHeaderLabels(['文件', '状态', '金额', '操作'])
+        self.setColumnCount(len(self.COLS))
+        self.setHorizontalHeaderLabels(self.COLS)
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(36)
         self.setShowGrid(False)
@@ -550,11 +786,10 @@ class FileTable(QTableWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        for c in (1, 2, 3):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         # 空态提示(列表没文件时居中显示)
-        self._hint = QLabel('点「＋选择文件」添加发票\n也可以把 PDF 拖到这里',
+        self._hint = QLabel('点「＋选择文件」添加发票\n也可以把 PDF/OFD 拖到这里',
                             self.viewport())
         self._hint.setObjectName('filehint')
         self._hint.setAlignment(Qt.AlignmentFlag.AlignHCenter |
@@ -603,7 +838,8 @@ class FileTable(QTableWidget):
     def dropEvent(self, e):
         if e.mimeData().hasUrls():
             paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-            paths = [p for p in paths if p.lower().endswith('.pdf')]
+            paths = [p for p in paths
+                     if p.lower().endswith(('.pdf', '.ofd'))]
             if paths:
                 self.filesDropped.emit(paths)
                 e.acceptProposedAction()
@@ -627,6 +863,7 @@ class DetailTable(QTableWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setAlternatingRowColors(True)
         self.setAcceptDrops(True)
+        self.setSortingEnabled(True)
         hdr = self.horizontalHeader()
         for c in (1, 2, 3, 4, 5, 6, 7):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
@@ -651,7 +888,8 @@ class DetailTable(QTableWidget):
             e.acceptProposedAction()
             return
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-        paths = [p for p in paths if p.lower().endswith('.pdf')]
+        paths = [p for p in paths
+                 if p.lower().endswith(('.pdf', '.ofd'))]
         if paths:
             self.filesDropped.emit(paths)
             e.acceptProposedAction()
@@ -809,12 +1047,71 @@ class MainWindow(QMainWindow):
         self._defer.setInterval(120)
         self._defer.timeout.connect(self._deferred_refresh)
         self._cur_id = None
+        self._expanded_fid = None     # 左栏点开的发票(展开行显示号码/日期)
         self._pool = QThreadPool.globalInstance()
+        self._restoring = False       # 恢复报销清单时不重复记历史
         self._build_ui()
         self._sync_incl_btn()
         self._sync_hist_btn()
+        self._apply_theme(_cfg_dark())
         self.refresh_files()
         self.refresh_detail()
+        self._setup_shortcuts()
+        self._restore_session()
+
+    def _restore_session(self):
+        """恢复上次退出时的报销清单(已不在磁盘的文件自动跳过)。"""
+        paths = [p for p in session_load() if os.path.isfile(p)]
+        session_save(paths)          # 先把缺文件的条目从清单里清掉
+        if paths:
+            self._restoring = True
+            try:
+                self.add_paths(paths, join=True)
+            finally:
+                self._restoring = False
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence('Ctrl+O'), self, activated=self.pick_files)
+        QShortcut(QKeySequence('Ctrl+F'), self, activated=self._focus_search)
+        QShortcut(QKeySequence('Escape'), self, activated=self._esc_back)
+        # Del 只在文件表获得焦点时触发, 不干扰搜索框里的文本编辑
+        sc = QShortcut(QKeySequence('Delete'), self.file_table)
+        sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc.activated.connect(self._del_current_row)
+
+    def _focus_search(self):
+        (self.search_hist if self._hist_on else self.search_files).setFocus()
+        (self.search_hist if self._hist_on else self.search_files).selectAll()
+
+    def _esc_back(self):
+        if self._hist_on:
+            self.toggle_history()
+
+    def _del_current_row(self):
+        r = self.file_table.currentRow()
+        it = self.file_table.item(r, 0) if r >= 0 else None
+        if it:
+            self.remove_by_id(it.data(Qt.ItemDataRole.UserRole))
+
+    def _apply_theme(self, dark):
+        """切主题: 重生成 QSS + 刷新所有在代码里上色的单元格。"""
+        global THEME
+        THEME = THEMES['dark' if dark else 'light']
+        QApplication.instance().setStyleSheet(build_qss(dark))
+        self.btn_theme.setToolTip('切换到%s色模式'
+                                  % ('浅' if dark else '深'))
+        self.btn_theme.setIcon(_icon('sun' if dark else 'moon', 17, '#ffffff'))
+        self.pdf_view.setBackgroundBrush(QColor(THEME['pvbg']))
+        self.refresh_files()
+        self.refresh_detail()
+        if self._hist_on:
+            self._hist_refresh_items()
+
+    def toggle_theme(self):
+        dark = not _cfg_dark()
+        SETTINGS.setValue('dark', '1' if dark else '0')
+        SETTINGS.sync()
+        self._apply_theme(dark)
 
     def _apply_default_size(self):
         """默认 1080x720 居中; 不锁死尺寸, 右上角最大化/拉伸都可用。"""
@@ -873,25 +1170,37 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(18, 0, 18, 0)
         lay.setSpacing(14)
-        t = QLabel('🧾 发票助手')
+        ic = QLabel()
+        ic.setPixmap(_icon('receipt', 22, '#ffffff').pixmap(22, 22))
+        ic.setStyleSheet('background: transparent;')
+        lay.addWidget(ic)
+        t = QLabel('发票助手')
         t.setObjectName('title')
         lay.addWidget(t)
         self.lbl_sum = QLabel('报销 0 张 ｜ 价税合计 0.00')
         self.lbl_sum.setObjectName('sum')
         lay.addWidget(self.lbl_sum)
         lay.addStretch(1)
-        self.btn_hist = QPushButton('🕘 历史记录')
+        self.btn_hist = QPushButton('历史记录')
         self.btn_hist.setObjectName('headbtn')
         self.btn_hist.setCheckable(True)
+        self.btn_hist.setIcon(_icon('clock', 15, '#ffffff'))
         self.btn_hist.setToolTip('按天查看已确认报销的发票（只存加入报销的）')
         self.btn_hist.clicked.connect(self.toggle_history)
         lay.addWidget(self.btn_hist)
         tip = QLabel('本地解析 · 文件不上传')
         tip.setObjectName('headtip')
         lay.addWidget(tip)
-        gear = QPushButton('⚙')
+        self.btn_theme = QPushButton()
+        self.btn_theme.setObjectName('gear')
+        self.btn_theme.setFixedSize(30, 30)
+        self.btn_theme.setToolTip('切换深色模式')
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        lay.addWidget(self.btn_theme)
+        gear = QPushButton()
         gear.setObjectName('gear')
         gear.setFixedSize(30, 30)
+        gear.setIcon(_icon('gear', 17, '#ffffff'))
         gear.setToolTip('设置')
         gear.clicked.connect(self.open_settings)
         lay.addWidget(gear)
@@ -920,6 +1229,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.left_stack, 1)
         return pan
 
+    @staticmethod
+    def _search_box(placeholder):
+        ed = QLineEdit()
+        ed.setObjectName('searchbox')
+        ed.setPlaceholderText(placeholder)
+        ed.setClearButtonEnabled(True)
+        ed.addAction(_icon('search', 14, '#8a9199'),
+                     QLineEdit.ActionPosition.LeadingPosition)
+        return ed
+
     def _file_page(self):
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -935,9 +1254,15 @@ class MainWindow(QMainWindow):
         h.addStretch(1)
         lay.addLayout(h)
 
+        self.search_files = self._search_box(
+            '搜索: 文件名 / 发票号码 / 销售方 / 日期')
+        self.search_files.textChanged.connect(lambda _: self.refresh_files())
+        lay.addWidget(self.search_files)
+
         r1 = QHBoxLayout()
         r1.setSpacing(7)
-        self.btn_addfile = QPushButton('＋选择文件')
+        self.btn_addfile = QPushButton('选择文件')
+        self.btn_addfile.setIcon(_icon('plus', 14, '#ffffff'))
         self.btn_addfile.clicked.connect(self.pick_files)
         r1.addWidget(self.btn_addfile)
         self.lbl_cnt = QLabel('0 个')
@@ -962,9 +1287,21 @@ class MainWindow(QMainWindow):
 
         self.file_table = FileTable()
         self.file_table.filesDropped.connect(lambda ps: self.add_paths(ps, join=True))
-        self.file_table.cellClicked.connect(lambda r, c: self.preview_row(r))
+        self.file_table.cellClicked.connect(self.on_file_clicked)
         lay.addWidget(self.file_table, 1)
         return page
+
+    def on_file_clicked(self, row, col):
+        """点文件行: 右上预览 + 在该行下方展开发票号码/开票日期(再点收起)。"""
+        it = self.file_table.item(row, 0)
+        if not it:                     # 展开行或空行
+            return
+        fid = it.data(Qt.ItemDataRole.UserRole)
+        f = self.by_id(fid)
+        if not f:
+            return
+        self._expanded_fid = None if self._expanded_fid == fid else fid
+        self.preview(f)
 
     def _history_page(self):
         page = QWidget()
@@ -980,11 +1317,20 @@ class MainWindow(QMainWindow):
         self.lbl_hist_cnt.setObjectName('tip')
         h.addWidget(self.lbl_hist_cnt)
         h.addStretch(1)
+        b = QPushButton('月度统计')
+        b.setObjectName('ghost')
+        b.clicked.connect(self.hist_monthly)
+        h.addWidget(b)
         b = QPushButton('清空')
         b.setObjectName('ghost')
         b.clicked.connect(self.hist_clear)
         h.addWidget(b)
         lay.addLayout(h)
+
+        self.search_hist = self._search_box('搜索: 文件名 / 号码 / 销售方')
+        self.search_hist.textChanged.connect(
+            lambda _: self._hist_refresh_items())
+        lay.addWidget(self.search_hist)
 
         tip = QLabel('按加入报销的那天分组 · 只存确认报销的')
         tip.setObjectName('tip')
@@ -1031,6 +1377,7 @@ class MainWindow(QMainWindow):
     def toggle_history(self):
         self._hist_on = not self._hist_on
         self.left_stack.setCurrentIndex(1 if self._hist_on else 0)
+        self._fade_stack()
         self._sync_hist_btn()
         if self._hist_on:
             self._hist_refresh_days()
@@ -1039,13 +1386,90 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_files()
 
+    def _fade_stack(self):
+        """切换文件/历史视图时来一点淡入, 硬切太生硬。"""
+        eff = QGraphicsOpacityEffect(self.left_stack)
+        self.left_stack.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b'opacity', self)
+        anim.setDuration(150)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(0.35)
+        anim.setEndValue(1.0)
+        anim.finished.connect(lambda: self.left_stack.setGraphicsEffect(None))
+        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def hist_monthly(self):
+        """按月合计: 月份 / 张数 / 价税合计(来自历史记录)。"""
+        months = {}
+        for x in self.history:
+            m = (x.get('day') or '')[:7]
+            if not m:
+                continue
+            agg = months.setdefault(m, [0, 0.0])
+            agg[0] += 1
+            t = x.get('total')
+            if isinstance(t, (int, float)):
+                agg[1] += t
+        dlg = QDialog(self)
+        dlg.setWindowTitle('按月统计')
+        dlg.setModal(True)
+        dlg.setMinimumWidth(360)
+        lay = QVBoxLayout(dlg)
+        table = QTableWidget(len(months) + (1 if months else 0), 3, dlg)
+        table.setHorizontalHeaderLabels(['月份', '张数', '价税合计'])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for r, m in enumerate(sorted(months, reverse=True)):
+            n, tot = months[m]
+            table.setItem(r, 0, QTableWidgetItem(m))
+            it = QTableWidgetItem(str(n))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(r, 1, it)
+            it = QTableWidgetItem('%.2f' % tot)
+            it.setForeground(QBrush(QColor(THEME['green'])))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(r, 2, it)
+        if months:
+            r = table.rowCount() - 1
+            tot_all = sum(v[1] for v in months.values())
+            n_all = sum(v[0] for v in months.values())
+            labels = ['合计', str(n_all), '%.2f' % tot_all]
+            for c, v in enumerate(labels):
+                it = QTableWidgetItem(v)
+                it.setFont(QFont('', -1, QFont.Weight.Bold))
+                it.setBackground(QBrush(QColor(THEME['totalRow'])))
+                if c:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                        | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, c, it)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        lay.addWidget(table)
+        if not months:
+            tip = QLabel('还没有历史记录')
+            tip.setObjectName('tip')
+            tip.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            lay.addWidget(tip)
+        b = QPushButton('关闭')
+        b.setObjectName('ghost')
+        b.clicked.connect(dlg.accept)
+        lay.addWidget(b, 0, Qt.AlignmentFlag.AlignHCenter)
+        dlg.resize(380, min(200 + 30 * len(months), 560))
+        dlg.exec()
+
     def _sync_hist_btn(self):
         if self._hist_on:
-            self.btn_hist.setText('🕘 返回文件')
+            self.btn_hist.setText('返回文件')
             self.btn_hist.setChecked(True)
         else:
             n = len(self.history)
-            self.btn_hist.setText('🕘 历史记录' + (' %d' % n if n else ''))
+            self.btn_hist.setText('历史记录' + (' %d' % n if n else ''))
             self.btn_hist.setChecked(False)
 
     def _hist_add(self, f):
@@ -1110,12 +1534,20 @@ class MainWindow(QMainWindow):
 
     def _hist_refresh_items(self):
         rows = self._hist_items_of_day()
+        kw = (self.search_hist.text().strip().lower()
+              if hasattr(self, 'search_hist') else '')
         self.hist_items.setRowCount(0)
         for x in rows:
+            if kw:
+                hay = ' '.join((x.get('name') or '', x.get('seller') or '',
+                                x.get('code') or '')).lower()
+                if kw not in hay:
+                    continue
             r = self.hist_items.rowCount()
             self.hist_items.insertRow(r)
             name = x.get('name') or os.path.basename(x.get('path') or '')
-            it = QTableWidgetItem('📄 ' + name)
+            it = QTableWidgetItem(name)
+            it.setIcon(_icon('doc', 16, '#98a2ac'))
             it.setData(Qt.ItemDataRole.UserRole, x.get('path'))
             it.setToolTip('%s\n销售方: %s\n发票号码: %s\n开票日期: %s\n加入报销: %s'
                           % (x.get('path') or '', x.get('seller') or '-',
@@ -1153,8 +1585,7 @@ class MainWindow(QMainWindow):
         if not it:
             return
         path = it.data(Qt.ItemDataRole.UserRole)
-        text = it.text()
-        name = text[2:] if text.startswith('📄 ') else text
+        name = it.text()
         f = next((p for p in self.files if p['path'] == path), None)
         if not f:
             f = {'id': None, 'name': name, 'path': path, 'inReimb': False,
@@ -1235,6 +1666,21 @@ class MainWindow(QMainWindow):
         h.addWidget(self.lbl_zoom)
         lay.addWidget(bar)
 
+        # 抬头信息条: 销售方 / 开票日期 / 发票号码(预览时更新)
+        meta = QFrame()
+        meta.setObjectName('pvbar')
+        mh = QHBoxLayout(meta)
+        mh.setContentsMargins(14, 5, 14, 5)
+        self.lbl_meta = QLabel('')
+        self.lbl_meta.setObjectName('pvmeta')
+        self.lbl_meta.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        mh.addWidget(self.lbl_meta)
+        mh.addStretch(1)
+        meta.hide()
+        lay.addWidget(meta)
+        self.meta_bar = meta
+
         self.pdf_view = PDFView()
         self.pdf_view.zoomChanged.connect(self._on_zoom)
         self.pdf_view.hasDoc.connect(self._on_hasdoc)
@@ -1242,6 +1688,21 @@ class MainWindow(QMainWindow):
         self.pdf_view.hint = ('单击左侧文件，在这里查看发票原件\n'
                               '滚轮缩放 · 按住左键拖动 · 滑块调缩放')
         return pan
+
+    def _update_meta(self, f):
+        """右上抬头信息: 销售方 · 开票日期 · 发票号码。"""
+        inv = (f or {}).get('inv') or {}
+        parts = []
+        if inv.get('销售方'):
+            parts.append(inv['销售方'])
+        if inv.get('开票日期'):
+            parts.append(inv['开票日期'])
+        if inv.get('发票号码'):
+            parts.append('No.' + str(inv['发票号码']))
+        if inv.get('备注'):
+            parts.append('⚠ ' + inv['备注'])
+        self.lbl_meta.setText(' ｜ '.join(parts))
+        self.meta_bar.setVisible(bool(parts))
 
     def _on_hasdoc(self, has):
         pass
@@ -1271,6 +1732,10 @@ class MainWindow(QMainWindow):
         self.lbl_items.setObjectName('tip')
         h.addWidget(self.lbl_items)
         h.addStretch(1)
+        self.search_detail = self._search_box('搜索: 商品 / 规格 / 来源')
+        self.search_detail.setFixedWidth(210)
+        self.search_detail.textChanged.connect(lambda _: self.refresh_detail())
+        h.addWidget(self.search_detail)
         self.btn_byitem = QPushButton('按商品汇总')
         self.btn_byitem.setObjectName('ghost')
         self.btn_byitem.clicked.connect(self.toggle_byitem)
@@ -1336,7 +1801,8 @@ class MainWindow(QMainWindow):
     # =================================================================
     def pick_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, '选择发票 PDF', cfg_dir(), 'PDF 文件 (*.pdf);;所有文件 (*)')
+            self, '选择发票文件', cfg_dir(),
+            '发票文件 (*.pdf *.ofd);;所有文件 (*)')
         if paths:
             SETTINGS.setValue('invoice_dir',
                               os.path.dirname(os.path.abspath(paths[0])))
@@ -1347,7 +1813,7 @@ class MainWindow(QMainWindow):
         self._batch_begin()
         try:
             for p in paths:
-                if p.lower().endswith('.pdf') and os.path.isfile(p):
+                if p.lower().endswith(('.pdf', '.ofd')) and os.path.isfile(p):
                     self._push(os.path.basename(p), p, join)
         finally:
             self._batch_end()
@@ -1360,13 +1826,23 @@ class MainWindow(QMainWindow):
             return
         self._seq += 1
         f = {'id': self._seq, 'name': name, 'path': path,
-             'inReimb': False, 'inv': None, 'parsing': False}
+             'inReimb': False, 'inv': None, 'parsing': False, 'dup': ''}
         self.files.append(f)
         if join:
             self.join(f)
 
     def by_id(self, fid):
         return next((f for f in self.files if f['id'] == fid), None)
+
+    def _file_match(self, f):
+        kw = self.search_files.text().strip().lower()
+        if not kw:
+            return True
+        inv = f.get('inv') or {}
+        hay = ' '.join((f.get('name') or '', str(inv.get('发票号码') or ''),
+                        str(inv.get('销售方') or ''),
+                        str(inv.get('开票日期') or ''))).lower()
+        return kw in hay
 
     def refresh_files(self):
         if self._suspend:
@@ -1376,35 +1852,49 @@ class MainWindow(QMainWindow):
         if f_cur:
             cur = f_cur['path']
         self.file_table.setRowCount(0)
+        shown = 0
         for f in self.files:
+            if not self._file_match(f):
+                continue
+            shown += 1
             r = self.file_table.rowCount()
             self.file_table.insertRow(r)
+            inv = f.get('inv') or {}
 
-            it = QTableWidgetItem('📄 ' + f['name'])
+            it = QTableWidgetItem(f['name'])
+            it.setIcon(_icon('doc', 16, '#98a2ac'))
             it.setData(Qt.ItemDataRole.UserRole, f['id'])
             it.setToolTip(f['path'])
             if f['path'] == cur:
-                it.setBackground(QColor('#eaf2ff'))
+                it.setBackground(QColor(THEME['selRow']))
             self.file_table.setItem(r, 0, it)
 
             if f['parsing']:
-                st, sc = '解析中', '#8a9199'
+                st, sc = '解析中', THEME['gray']
+            elif f.get('dup'):
+                st, sc = '重复', THEME['warn']
             elif f['inReimb']:
-                st, sc = '报销', '#1a7f37'
+                st, sc = '报销', THEME['green']
             else:
-                st, sc = '未加入', '#8a9199'
+                st, sc = '未加入', THEME['gray']
             c1 = QTableWidgetItem(st)
             c1.setForeground(QBrush(QColor(sc)))
             self.file_table.setItem(r, 1, c1)
 
-            if f['inReimb']:
+            if f.get('dup'):
+                val, sc = '', THEME['warn']
+            elif f['inReimb']:
                 if f['inv'] is None or f['inv'].get('价税合计') is None:
-                    val, sc = '失败', '#cf222e'
+                    val, sc = '失败', THEME['red']
                 else:
-                    val, sc = _fmt(f['inv'].get('价税合计')), '#1a7f37'
+                    val, sc = _fmt(f['inv'].get('价税合计')), THEME['green']
             else:
-                val, sc = '', '#b1b6bb'
-            c2 = QTableWidgetItem(val)
+                val, sc = '', THEME['dim']
+            try:
+                _vkey = float(val)          # 金额列按数值排序(负数/失败行退回文本)
+            except ValueError:
+                _vkey = None
+            c2 = _SortItem(val, key=_vkey)
             c2.setForeground(QBrush(QColor(sc)))
             c2.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.file_table.setItem(r, 2, c2)
@@ -1432,7 +1922,25 @@ class MainWindow(QMainWindow):
             bh.addStretch(1)
             self.file_table.setCellWidget(r, 3, box)
 
-        self.lbl_cnt.setText('%d 个' % len(self.files))
+            # 点击过的发票在此行下方展开一行, 显示发票号码 / 开票日期
+            if f['id'] == self._expanded_fid:
+                er = self.file_table.rowCount()
+                self.file_table.insertRow(er)
+                if inv.get('发票号码'):
+                    detail = '发票号码：%s ｜ 开票日期：%s' % (
+                        inv.get('发票号码'), inv.get('开票日期') or '未知')
+                elif f['parsing']:
+                    detail = '解析中…'
+                else:
+                    detail = '未解析(加入报销后自动解析)'
+                eit = QTableWidgetItem('↳ ' + detail)
+                eit.setForeground(QBrush(QColor(THEME['gray'])))
+                self.file_table.setItem(er, 0, eit)
+                self.file_table.setSpan(er, 0, 1, len(FileTable.COLS))
+
+        self.lbl_cnt.setText(('%d / %d 个' % (shown, len(self.files)))
+                             if shown != len(self.files)
+                             else '%d 个' % len(self.files))
         self.file_table.set_empty(not self.files)
 
     # ---------- 加入 / 移出 / 删除 ----------
@@ -1447,6 +1955,7 @@ class MainWindow(QMainWindow):
             f['inReimb'] = False
             self.refresh_files()
             self.refresh_detail()
+            self._sync_session()
 
     def remove_by_id(self, fid):
         f = self.by_id(fid)
@@ -1457,11 +1966,13 @@ class MainWindow(QMainWindow):
             self.clear_preview()
         self.refresh_files()
         self.refresh_detail()
+        self._sync_session()
 
     def join(self, f):
         if f['inReimb'] or f['parsing']:
             return
         f['parsing'] = True
+        f['dup'] = ''                  # 重新加入时清掉旧的重复标记
         self.refresh_files()
         task = ParseTask(f['path'])
         task.sig.done.connect(self._on_parsed)
@@ -1473,12 +1984,37 @@ class MainWindow(QMainWindow):
             if f['path'] == path:
                 f['parsing'] = False
                 f['inv'] = inv
-                f['inReimb'] = True
                 hit = f
                 break
         if hit:
-            self._hist_add(hit)      # 只保存加入报销的 -> 历史
+            # 发票号码去重: 同一张票(改了文件名再拖进来)只允许进一次报销
+            num = (inv or {}).get('发票号码')
+            dup = None
+            if num:
+                dup = next((x for x in self.files if x is not hit
+                            and x['inReimb']
+                            and (x.get('inv') or {}).get('发票号码') == num),
+                           None)
+            if dup:
+                hit['inReimb'] = False
+                hit['dup'] = num
+                self.statusBar().showMessage(
+                    '重复发票: 与「%s」是同一张(号码相同), 已跳过'
+                    % os.path.basename(dup['path']), 8000)
+            else:
+                hit['inReimb'] = True
+                hit['dup'] = ''
+                if not self._restoring:
+                    self._hist_add(hit)   # 只保存加入报销的 -> 历史
+                if hit['id'] == self._cur_id:
+                    self._update_meta(hit)
+        self._sync_session()
         self._queue_refresh()
+
+    def _sync_session(self):
+        """报销成员变化时把清单落盘(启动恢复期间不保存, 防止覆盖)。"""
+        if not self._restoring:
+            session_save([f['path'] for f in self.reimb_files()])
 
     # ---------- 批量刷新闸: 一次操作只重建一次表格 ----------
     def _batch_begin(self):
@@ -1516,6 +2052,7 @@ class MainWindow(QMainWindow):
             f['inReimb'] = False
         self.refresh_files()
         self.refresh_detail()
+        self._sync_session()
 
     def remove_all(self):
         """清空文件列表(只从列表移除, 不动磁盘上的 PDF)。"""
@@ -1533,6 +2070,7 @@ class MainWindow(QMainWindow):
         self.clear_preview()
         self.refresh_files()
         self.refresh_detail()
+        self._sync_session()
 
     def join_rows(self, rows):
         self._batch_begin()
@@ -1558,25 +2096,45 @@ class MainWindow(QMainWindow):
 
     def preview(self, f):
         self._cur_id = f['id']
-        self.lbl_pvfile.setText('📄 ' + _elide_name(f['name']))
+        self.lbl_pvfile.setText(_elide_name(f['name']))
         self.lbl_pvfile.setToolTip(f['path'])
+        self._update_meta(f)
+        if str(f.get('path') or '').lower().endswith('.ofd'):
+            # OFD 只解析不渲染(没有内置渲染器), 界面上给个说明
+            self.pdf_view.clear()
+            self.pdf_view.set_warn(False)
+            self.lbl_pvfile.setProperty('error', False)
+            self._repolish(self.lbl_pvfile)
+            self.pdf_view.hint = ('OFD 发票暂不支持预览\n'
+                                  '数据已正常解析, 合计与明细照常统计')
+            self.pdf_view.viewport().update()
+            self._on_zoom(1.0)
+            return
         ok = self.pdf_view.load(f['path'])
         self.pdf_view.set_warn(not ok)
-        if ok:
-            self.lbl_pvfile.setStyleSheet('')
-        else:
-            self.lbl_pvfile.setStyleSheet('color:#ff6b6b; font-weight:bold;')
+        self.lbl_pvfile.setProperty('error', not ok)
+        self._repolish(self.lbl_pvfile)
+        if not ok:
             self.pdf_view.hint = ('打不开这个文件\n'
                                   '请确认它是可以正常读取的 PDF')
             self.pdf_view.viewport().update()
         self._on_zoom(1.0)
         self.refresh_files()
 
+    @staticmethod
+    def _repolish(w):
+        st = w.style()
+        st.unpolish(w)
+        st.polish(w)
+
     def clear_preview(self):
         self._cur_id = None
         self.pdf_view.clear()
         self.lbl_pvfile.setText('')
-        self.lbl_pvfile.setStyleSheet('')
+        self.lbl_pvfile.setProperty('error', False)
+        self._repolish(self.lbl_pvfile)
+        self.lbl_meta.setText('')
+        self.meta_bar.hide()
         self.pdf_view.set_warn(False)
         self.pdf_view.hint = ('单击左侧文件，在这里查看发票原件\n'
                               '滚轮缩放 · 按住左键拖动 · 滑块调缩放')
@@ -1641,7 +2199,18 @@ class MainWindow(QMainWindow):
     def refresh_detail(self):
         if self._suspend:
             return
-        rows = self.rows_grouped() if self._by_item else self.rows_flat()
+        all_rows = self.rows_grouped() if self._by_item else self.rows_flat()
+        kw = self.search_detail.text().strip().lower()
+        rows = all_rows
+        if kw:
+            rows = [r for r in all_rows
+                    if kw in ' '.join((str(r.get('名称') or ''),
+                                       str(r.get('规格') or ''),
+                                       str(r.get('src') or ''))).lower()]
+            self.lbl_items.setText('%d / %d 项(过滤)' % (len(rows), len(all_rows)))
+        else:
+            self.lbl_items.setText('%d 项' % len(all_rows))
+        self.detail_table.setSortingEnabled(False)   # 填充期间不能实时重排
         self.detail_table.setRowCount(0)
         for r in rows:
             rr = self.detail_table.rowCount()
@@ -1655,16 +2224,22 @@ class MainWindow(QMainWindow):
                     _esc(r.get('src'))]
             neg = r.get('金额') is not None and r['金额'] < 0
             for c, v in enumerate(vals):
-                it = QTableWidgetItem(v)
+                key = v
+                if c in (2, 3, 4, 6, 7):     # 数值列: 按数值排序而非文本
+                    try:
+                        key = float(v)
+                    except ValueError:
+                        key = v
+                it = _SortItem(v, key=key)
                 if c in (2, 3, 4, 6, 7):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if neg and c == 4:
-                    it.setForeground(QBrush(QColor('#cf222e')))
+                    it.setForeground(QBrush(QColor(THEME['red'])))
                 if c == 0:
                     it.setData(Qt.ItemDataRole.UserRole, r.get('fid'))
                     it.setToolTip('点击这一行, 右上角显示这张发票的原件')
                 if c == 8:
-                    it.setForeground(QBrush(QColor('#8a9199')))
+                    it.setForeground(QBrush(QColor(THEME['gray'])))
                     it.setToolTip('点击查看原件')
                 self.detail_table.setItem(rr, c, it)
 
@@ -1693,8 +2268,7 @@ class MainWindow(QMainWindow):
         self.kpis['tTax'].setText('%.2f' % tax)
         self.kpis['tTot'].setText('%.2f' % tot)
         self.kpis['tInv'].setText(str(n))
-        self.kpis['tRows'].setText(str(len(rows)))
-        self.lbl_items.setText('%d 项' % len(rows))
+        self.kpis['tRows'].setText(str(len(all_rows)))
         self.lbl_sum.setText('报销 %d 张 ｜ 价税合计 %.2f' % (n, tot))
 
         if rows:
@@ -1705,12 +2279,14 @@ class MainWindow(QMainWindow):
             vals = ['合计', '', '', '', '%.2f' % fa, '', '%.2f' % ft,
                     '%.2f' % (fa + ft), '']
             for c, v in enumerate(vals):
-                it = QTableWidgetItem(v)
+                it = _SortItem(v, key=(math.inf if c in (2, 3, 4, 6, 7)
+                                       else '\uffff'))
                 it.setFont(QFont('', -1, QFont.Weight.Bold))
-                it.setBackground(QBrush(QColor('#fffdf3')))
+                it.setBackground(QBrush(QColor(THEME['totalRow'])))
                 if c in (4, 6, 7):
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.detail_table.setItem(rr, c, it)
+        self.detail_table.setSortingEnabled(True)
 
     def _detail_clicked(self, row, col):
         """明细里点任意一格 -> 右上角显示这条商品所在发票的原件。"""
@@ -1745,20 +2321,15 @@ class MainWindow(QMainWindow):
                                   if on else '不含税'), 4000)
 
     def _sync_incl_btn(self):
-        self.btn_incl.setStyleSheet(
-            'background:#1f6feb; color:#fff; border:none; border-radius:7px; '
-            'padding:6px 13px;' if self.price_incl else '')
+        self.btn_incl.setProperty('active', self.price_incl)
+        self._repolish(self.btn_incl)
         self.btn_incl.setText('价格含税 ✓' if self.price_incl else '价格含税')
 
     def toggle_byitem(self):
         self._by_item = not self._by_item
         self.btn_byitem.setText('按发票明细' if self._by_item else '按商品汇总')
-        if self._by_item:
-            self.btn_byitem.setStyleSheet(
-                'background:#1f6feb; color:#fff; border:none; border-radius:7px; '
-                'padding:6px 13px;')
-        else:
-            self.btn_byitem.setStyleSheet('')
+        self.btn_byitem.setProperty('active', self._by_item)
+        self._repolish(self.btn_byitem)
         self.refresh_detail()
 
     # =================================================================
@@ -1973,18 +2544,16 @@ class MainWindow(QMainWindow):
 
 
 # ======================================================================
-#  样式
+#  样式: 单一模板 + 浅色/深色两套调色板(build_qss 生成)
 # ======================================================================
-QSS = """
+QSS_TMPL = """
 * { font-family: "Microsoft YaHei UI"; }
-QMainWindow { background: #eef1f6; }
-QWidget { background: transparent; color: #24292f; }
+QMainWindow { background: %(win)s; }
+QWidget { background: transparent; color: %(text)s; }
 QFrame#header { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-    stop:0 #1f6feb, stop:1 #3a86ff);
+    stop:0 %(head0)s, stop:1 %(head1)s);
     border-bottom: 1px solid rgba(0,0,0,24); }
 QLabel#title { color: #fff; font-size: 16px; font-weight: bold; background: transparent; }
-QLabel#folder { color: #fff; font-size: 12px; background: rgba(255,255,255,45);
-    border-radius: 10px; padding: 3px 10px; }
 QLabel#sum { color: #fff; font-size: 13px; background: rgba(255,255,255,42);
     border-radius: 10px; padding: 5px 14px; }
 QLabel#headtip { color: rgba(255,255,255,175); font-size: 12px;
@@ -1997,91 +2566,136 @@ QPushButton#headbtn { background: rgba(255,255,255,44); color: #fff;
     border: 1px solid rgba(255,255,255,110); border-radius: 7px;
     padding: 5px 13px; font-size: 13px; min-height: 18px; }
 QPushButton#headbtn:hover { background: rgba(255,255,255,88); }
-QPushButton#headbtn:checked { background: #fff; color: #1f6feb;
+QPushButton#headbtn:checked { background: #fff; color: %(head0)s;
     border-color: #fff; font-weight: bold; }
-QDialog#settings { background: #ffffff; }
-QDialog { background: #ffffff; }
-QMessageBox { background: #ffffff; }
-QMessageBox QLabel { color: #24292f; background: transparent;
+QDialog#settings { background: %(dlg)s; }
+QDialog { background: %(dlg)s; }
+QMessageBox { background: %(dlg)s; }
+QMessageBox QLabel { color: %(text)s; background: transparent;
     font-size: 13px; }
 QMessageBox QLabel#titleBarLabel { font-weight: bold; }
-QLabel#dlgTitle { font-size: 16px; font-weight: bold; color: #1c2430;
+QLabel#dlgTitle { font-size: 16px; font-weight: bold; color: %(kpitext)s;
     background: transparent; }
-QLineEdit { background: #fff; color: #24292f; border: 1px solid #d7dee7;
-    border-radius: 6px; padding: 6px 9px; selection-background-color: #1f6feb; }
-QLineEdit:focus { border-color: #1f6feb; }
-QFrame#panel { background: #fff; border: 1px solid #e3e8ef; border-radius: 10px; }
-QLabel#panelTitle { font-size: 14px; font-weight: bold; color: #1c2430;
+QLineEdit { background: %(linebg)s; color: %(text)s; border: 1px solid %(lineborder)s;
+    border-radius: 6px; padding: 6px 9px; selection-background-color: %(acc)s; }
+QLineEdit:focus { border-color: %(acc)s; }
+QFrame#panel { background: %(panel)s; border: 1px solid %(border)s; border-radius: 10px; }
+QLabel#panelTitle { font-size: 14px; font-weight: bold; color: %(kpitext)s;
     background: transparent; }
-QLabel#tip { color: #8a9199; font-size: 12px; background: transparent; }
-QLabel#subhead { color: #57606a; font-size: 12px; font-weight: bold;
+QLabel#tip { color: %(sub)s; font-size: 12px; background: transparent; }
+QLabel#subhead { color: %(statustext)s; font-size: 12px; font-weight: bold;
     background: transparent; }
-QListWidget#histdays { background: #fff; border: 1px solid #e3e8ef;
+QListWidget#histdays { background: %(panel)s; border: 1px solid %(border)s;
     border-radius: 9px; padding: 4px; outline: none; font-size: 13px; }
 QListWidget#histdays::item { padding: 8px 9px; border-radius: 7px;
-    color: #24292f; }
-QListWidget#histdays::item:hover { background: #f2f7ff; }
-QListWidget#histdays::item:selected { background: #1f6feb; color: #fff; }
-QTableWidget#histitems { border: 1px solid #e3e8ef; border-radius: 9px; }
-QLabel#badge { color: #8a9199; font-size: 12px; background: #f1f4f8;
+    color: %(text)s; }
+QListWidget#histdays::item:hover { background: %(hover)s; }
+QListWidget#histdays::item:selected { background: %(acc)s; color: #fff; }
+QTableWidget#histitems { border: 1px solid %(border)s; border-radius: 9px; }
+QLabel#badge { color: %(badgetext)s; font-size: 12px; background: %(badbg)s;
     border-radius: 9px; padding: 2px 9px; }
-QLabel#others { color: #9aa0a6; font-size: 11px; border-top: 1px dashed #edf0f4; }
 QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-    stop:0 #2f7dff, stop:1 #1f6feb); color: #fff; border: none;
+    stop:0 %(btn0)s, stop:1 %(btn1)s); color: #fff; border: none;
     border-radius: 7px; padding: 6px 13px; min-height: 20px; }
-QPushButton:hover { background: #3a86ff; }
-QPushButton:pressed { background: #1a5fd0; }
+QPushButton:hover { background: %(btnhover)s; }
+QPushButton:pressed { background: %(btnpress)s; }
 QPushButton:focus { outline: none; }
-QPushButton#ghost { background: #fff; color: #33404f; border: 1px solid #d7dee7; }
-QPushButton#ghost:hover { background: #f3f7ff; border-color: #9dc0ff; }
+QPushButton[active="true"] { background: %(btn1)s; }
+QPushButton[active="true"]:hover { background: %(btnhover)s; }
+QPushButton#ghost { background: %(ghostbg)s; color: %(ghosttext)s; border: 1px solid %(ghostborder)s; }
+QPushButton#ghost:hover { background: %(ghosthover)s; border-color: %(ghostbordh)s; }
 QPushButton#tiny { padding: 3px 9px; border-radius: 6px; }
 QPushButton#tiny#ghost, QPushButton#tiny.ghost {
-    background: #fff; color: #33404f; border: 1px solid #d7dee7; }
-QPushButton#tiny.ghost:hover { background: #f3f7ff; }
-QPushButton#del { background: transparent; color: #b1b6bb; font-size: 15px;
+    background: %(ghostbg)s; color: %(ghosttext)s; border: 1px solid %(ghostborder)s; }
+QPushButton#tiny.ghost:hover { background: %(ghosthover)s; }
+QPushButton#del { background: transparent; color: %(sub)s; font-size: 15px;
     padding: 0; border: none; border-radius: 5px; }
-QPushButton#del:hover { background: #ffe9e6; color: #cf222e; }
-QTableWidget { background: #fff; alternate-background-color: #fafbfd;
-    border: none; gridline-color: #f1f3f6; font-size: 13px; }
+QPushButton#del:hover { background: %(delbg)s; color: %(delred)s; }
+QTableWidget { background: %(panel)s; alternate-background-color: %(altrow)s;
+    border: none; gridline-color: %(grid)s; font-size: 13px; }
 QTableWidget::item { padding: 4px; }
-QTableWidget::item:hover { background: #f2f7ff; }
-QTableWidget::item:selected { background: #eaf2ff; color: #24292f; }
-QHeaderView::section { background: #f7f9fc; color: #444c56; font-size: 12px;
-    font-weight: bold; border: none; border-bottom: 1px solid #e6ebf2;
+QTableWidget::item:hover { background: %(hover)s; }
+QTableWidget::item:selected { background: %(sel)s; color: %(text)s; }
+QHeaderView::section { background: %(hdrbg)s; color: %(hdrtext)s; font-size: 12px;
+    font-weight: bold; border: none; border-bottom: 1px solid %(hdrline)s;
     padding: 7px; }
+QHeaderView::section:hover { background: %(hover)s; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #ccd5e0; border-radius: 5px;
+QScrollBar::handle:vertical { background: %(sb)s; border-radius: 5px;
     min-height: 30px; }
-QScrollBar::handle:vertical:hover { background: #a7b3c4; }
+QScrollBar::handle:vertical:hover { background: %(sbh)s; }
 QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
-QScrollBar::handle:horizontal { background: #ccd5e0; border-radius: 5px;
+QScrollBar::handle:horizontal { background: %(sb)s; border-radius: 5px;
     min-width: 30px; }
-QScrollBar::handle:horizontal:hover { background: #a7b3c4; }
+QScrollBar::handle:horizontal:hover { background: %(sbh)s; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-QFrame#pvbar { background: #fbfcfe; border-bottom: 1px solid #edf0f4; }
-QLabel#pvname { font-weight: bold; color: #33404f; background: transparent; }
-QLabel#pvfile { color: #57606a; font-size: 12px; background: transparent;
+QFrame#pvbar { background: %(pvbar)s; border-bottom: 1px solid %(pvline)s; }
+QLabel#pvname { font-weight: bold; color: %(ghosttext)s; background: transparent; }
+QLabel#pvfile { color: %(sub)s; font-size: 12px; background: transparent;
     padding: 2px 6px; }
-QLabel#zoomval { color: #1f6feb; background: #eaf2ff; border-radius: 9px;
+QLabel#pvfile[error="true"] { color: %(delred)s; font-weight: bold; }
+QLabel#pvmeta { color: %(statustext)s; font-size: 12px; background: transparent; }
+QLabel#zoomval { color: %(zoomtext)s; background: %(zoombg)s; border-radius: 9px;
     padding: 2px 4px; min-width: 48px; }
-QSlider::groove:horizontal { height: 5px; border-radius: 5px; background: #dde3ea; }
-QSlider::sub-page:horizontal { background: #1f6feb; border-radius: 5px; }
-QSlider::handle:horizontal { background: #fff; border: 2px solid #1f6feb;
+QSlider::groove:horizontal { height: 5px; border-radius: 5px; background: %(sb)s; }
+QSlider::sub-page:horizontal { background: %(acc)s; border-radius: 5px; }
+QSlider::handle:horizontal { background: #fff; border: 2px solid %(acc)s;
     width: 14px; height: 14px; border-radius: 8px; margin: -6px 0; }
-QLabel#pvempty { color: #aeb4bc; font-size: 14px; background: transparent; }
-QLabel#filehint { color: #aeb4bc; font-size: 13px; background: transparent; }
-QFrame#detailbar { background: #fbfcfe; border-bottom: 1px solid #edf0f4; }
-QFrame#kpiwrap { background: #f7f9fc; border-bottom: 1px solid #edf0f4; }
-QFrame#kpi { background: #fff; border: 1px solid #e6ebf2; border-radius: 8px; }
-QLabel#kpik { color: #8a9199; font-size: 11px; background: transparent; }
-QLabel#kpiv { color: #1c2430; font-size: 16px; font-weight: bold;
+QLabel#pvempty { color: %(hinttext)s; font-size: 14px; background: transparent; }
+QLabel#filehint { color: %(hinttext)s; font-size: 13px; background: transparent; }
+QFrame#detailbar { background: %(pvbar)s; border-bottom: 1px solid %(pvline)s; }
+QFrame#kpiwrap { background: %(kpiwrap)s; border-bottom: 1px solid %(pvline)s; }
+QFrame#kpi { background: %(kpibg)s; border: 1px solid %(kpiborder)s; border-radius: 8px; }
+QLabel#kpik { color: %(sub)s; font-size: 11px; background: transparent; }
+QLabel#kpiv { color: %(kpitext)s; font-size: 16px; font-weight: bold;
     background: transparent; }
-QFrame#kpi[kind="accent"] QLabel#kpiv { color: #1f6feb; }
-QFrame#kpi[kind="green"] QLabel#kpiv { color: #1a7f37; }
+QFrame#kpi[kind="accent"] QLabel#kpiv { color: %(acc)s; }
+QFrame#kpi[kind="green"] QLabel#kpiv { color: %(green)s; }
 QSplitter::handle { background: transparent; }
-QStatusBar { background: #f7f9fc; color: #57606a; }
+QStatusBar { background: %(statusbg)s; color: %(statustext)s; }
 """
+
+
+def build_qss(dark=False):
+    """按主题生成全局 QSS(颜色只在这一处定义)。"""
+    if dark:
+        C = dict(
+            win='#16181d', panel='#1f232b', border='#30363d', text='#d7dde3',
+            sub='#8b949e', head0='#17406b', head1='#2469b8',
+            btn0='#2a6cc0', btn1='#2260ad', btnhover='#3178d6',
+            btnpress='#1c5296',
+            altrow='#1a1e25', grid='#262c35', hover='#263241', sel='#1f3a5f',
+            hdrbg='#232933', hdrtext='#aab3bd', hdrline='#30363d',
+            sb='#3a4149', sbh='#4d5661', pvbar='#1c2129', pvline='#30363d',
+            zoombg='#1f3a5f', zoomtext='#79b8ff', kpiwrap='#1a1e25',
+            kpibg='#232933', kpiborder='#30363d', kpitext='#e6edf3',
+            linebg='#16181d', lineborder='#3a4149',
+            ghostbg='#232933', ghosttext='#cdd6df', ghostborder='#3a4149',
+            ghosthover='#2a3240', ghostbordh='#4d7cc1',
+            badbg='#262c35', badgetext='#9aa4ae', dlg='#1f232b',
+            acc='#4493f8', green='#3fb950', delbg='#3a2226', delred='#f85149',
+            hinttext='#6e7681', statusbg='#1a1e25', statustext='#9aa4ae',
+        )
+    else:
+        C = dict(
+            win='#eef1f6', panel='#ffffff', border='#e3e8ef', text='#24292f',
+            sub='#8a9199', head0='#1f6feb', head1='#3a86ff',
+            btn0='#2f7dff', btn1='#1f6feb', btnhover='#3a86ff',
+            btnpress='#1a5fd0',
+            altrow='#fafbfd', grid='#f1f3f6', hover='#f2f7ff', sel='#eaf2ff',
+            hdrbg='#f7f9fc', hdrtext='#444c56', hdrline='#e6ebf2',
+            sb='#ccd5e0', sbh='#a7b3c4', pvbar='#fbfcfe', pvline='#edf0f4',
+            zoombg='#eaf2ff', zoomtext='#1f6feb', kpiwrap='#f7f9fc',
+            kpibg='#ffffff', kpiborder='#e6ebf2', kpitext='#1c2430',
+            linebg='#ffffff', lineborder='#d7dee7',
+            ghostbg='#ffffff', ghosttext='#33404f', ghostborder='#d7dee7',
+            ghosthover='#f3f7ff', ghostbordh='#9dc0ff',
+            badbg='#f1f4f8', badgetext='#8a9199', dlg='#ffffff',
+            acc='#1f6feb', green='#1a7f37', delbg='#ffe9e6', delred='#cf222e',
+            hinttext='#aeb4bc', statusbg='#f7f9fc', statustext='#57606a',
+        )
+    return QSS_TMPL % C
 
 
 # ======================================================================
@@ -2089,7 +2703,7 @@ QStatusBar { background: #f7f9fc; color: #57606a; }
 # ======================================================================
 class Splash(QWidget):
     finished = Signal()
-    DURATION = 3.0       # 动画总时长(秒)
+    DURATION = 1.2       # 动画总时长(秒): 够看清品牌又不用等
     FADE = 0.28          # 淡入/淡出时长(秒)
 
     def __init__(self):
@@ -2186,6 +2800,8 @@ class Splash(QWidget):
 
     def _scale(self):
         """返回 (横向, 纵向): 快速压扁 → 阻尼回弹(带一点过冲) → 静止。"""
+        if self._skip:
+            return 1.0, 1.0          # 跳过 = 立刻静止(弹簧来不及收敛)
         t = self._t
         T = 0.55                                  # 压缩阶段
         if t < T:
@@ -2255,7 +2871,7 @@ class Splash(QWidget):
         p.drawRoundedRect(QRectF(130, 426, 200 * prog, 8), 4, 4)
 
         # 单击跳过提示
-        if 0.6 < self._t < self.DURATION:
+        if 0.3 < self._t < self.DURATION:
             p.setPen(QColor('#b1b6bb'))
             f4 = QFont()
             f4.setPixelSize(11)
@@ -2277,7 +2893,7 @@ def main():
     f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(f)
-    app.setStyleSheet(QSS)
+    # 全局样式由 MainWindow._apply_theme 按本机保存的主题生成(浅色/深色)
 
     bench = bool(os.environ.get('FAPIAO_BENCH'))
 

@@ -15,6 +15,8 @@ sys.path.insert(0, ROOT)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 os.environ["FAPIAO_HIST"] = os.path.join(TMP, 'hist_verify.json')
+os.environ["FAPIAO_SETTINGS"] = os.path.join(TMP, 'fp_test.ini')
+os.environ["FAPIAO_NO_SESSION"] = "1"
 
 from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 

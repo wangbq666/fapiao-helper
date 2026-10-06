@@ -17,6 +17,9 @@ HIST = os.path.join(TMP, 'hist_test.json')
 if os.path.exists(HIST):
     os.remove(HIST)
 os.environ['FAPIAO_HIST'] = HIST
+os.environ['FAPIAO_SETTINGS'] = os.path.join(TMP, 'fp_test.ini')
+os.environ['FAPIAO_NO_SESSION'] = '1'
+
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
                               errors='replace')

@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 构建脚本: 去掉 openpyxl 的可选重依赖(numpy/pandas/scipy/PIL/lxml/matplotlib)
-# 以及用不到的 Qt 模块, 显著瘦身。
+# onedir 版构建脚本: 产物是 distqt\发票助手\ 文件夹(启动快, 免去 onefile
+# 每次运行解压到 %TEMP% 的开销)。分发时把整个文件夹打成一个 7z/zip。
+# 排除清单与 发票助手Qt.spec 保持一致(改动时两边同步)。
 
 a = Analysis(
     ['../发票助手Qt.py'],
@@ -26,7 +27,6 @@ a = Analysis(
     optimize=0,
 )
 
-# ---- 去掉用不到的二进制(Qt Quick/Qml/Pdf/Network/OpenGL/虚拟键盘等) ----
 _DROP = (
     'opengl32sw', 'd3dcompiler_47',
     'qt6qml', 'qt6quick', 'qt6pdf', 'qt6network', 'qt6opengl',
@@ -63,9 +63,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='发票助手',
     debug=False,
     bootloader_ignore_signals=False,
@@ -74,12 +73,18 @@ exe = EXE(
     upx_exclude=['qwindows.dll', 'Qt6Core.dll', 'Qt6Gui.dll',
                  'Qt6Widgets.dll', 'VCRUNTIME140.dll',
                  'VCRUNTIME140_1.dll'],
-    runtime_tmpdir=None,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
     icon='fapiao.ico',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=['qwindows.dll', 'Qt6Core.dll', 'Qt6Gui.dll',
+                 'Qt6Widgets.dll', 'VCRUNTIME140.dll',
+                 'VCRUNTIME140_1.dll'],
+    name='发票助手',
 )

@@ -69,7 +69,11 @@ def extract_items(doc):
 
 
 def _items_on_page(page):
-    lines = _lines_of(page)
+    return _items_from_lines(_lines_of(page))
+
+
+def _items_from_lines(lines):
+    """从 (中心x, 中心y, 文本) 行列表还原明细(与 PDF/OFD 无关的通用逻辑)."""
     if not lines:
         return []
 
@@ -168,20 +172,78 @@ def _items_on_page(page):
     return items
 
 
-def extract_invoice(pdf_path):
-    """从单个PDF提取发票信息(含商品明细), 返回 dict."""
-    base = os.path.basename(pdf_path)
+def _ofd_pages(path):
+    """读取 OFD(本质是 zip+XML), 返回 (每页文字行列表, 全部文字).
+
+    OFD 坐标单位是 0.1mm, 换算成 pt(1pt=0.3528mm) 后即可复用 PDF 的
+    坐标聚类逻辑。返回值格式与 PDF 分支一致, 后续处理共用。
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    MM = 72.0 / 254.0          # 0.1mm -> pt
+
+    def _attr(el, name):
+        for k, v in el.attrib.items():
+            if k.split('}')[-1] == name:
+                return v
+        return None
+
+    def _bbox(s):
+        try:
+            v = [float(x) for x in re.split(r'[ ,]+', (s or '').strip()) if x]
+            if len(v) >= 4:
+                return v[0], v[1], v[2], v[3]
+        except ValueError:
+            pass
+        return 0.0, 0.0, 0.0, 0.0
+
+    pages, texts = [], []
+    with zipfile.ZipFile(path) as zf:
+        for name in sorted(n for n in zf.namelist()
+                           if n.endswith('Content.xml')):
+            root = ET.fromstring(zf.read(name))
+            lines = []
+            for tobj in root.iter():
+                if tobj.tag.split('}')[-1] != 'TextObject':
+                    continue
+                tb = _bbox(_attr(tobj, 'Boundary'))
+                for tc in tobj.iter():
+                    if tc.tag.split('}')[-1] != 'TextCode':
+                        continue
+                    t = ''.join(tc.itertext()).strip()
+                    if not t:
+                        continue
+                    cb = _attr(tc, 'Boundary')
+                    x, y, w, h = _bbox(cb) if cb else tb
+                    lines.append(((x + w / 2) * MM, (y + h / 2) * MM, t))
+                    texts.append(t)
+            if lines:
+                pages.append(lines)
+    return pages, '\n'.join(texts)
+
+
+def _extract_ofd(path):
+    base = os.path.basename(path)
     try:
-        doc = fitz.open(pdf_path)
-        text = ''.join(p.get_text() for p in doc)
-        items = extract_items(doc)
-        doc.close()
-    except Exception as e:
+        pages, text = _ofd_pages(path)
+        items = []
+        for lines in pages:
+            items.extend(_items_from_lines(lines))
+    except Exception as e:  # noqa: BLE001
         return {'文件名': base, '金额': None, '税额': None, '价税合计': None,
-                '备注': 'PDF读取失败: %s' % e, '明细': []}
+                '备注': 'OFD读取失败: %s' % e, '明细': []}
+    return _finish(base, text, items)
+
+
+def _finish(base, text, items):
+    """抬头金额/销售方/明细核对: PDF 与 OFD 共用的后处理。"""
 
     ys = re.findall(r'¥\s*([\d,]+\.\d{2})', text)
     num = re.search(r'发票号码[:：]*\s*(\d+)', text)
+    if not num:
+        # 数电票: 「发票号码：」标签与 20 位号码常分属不同文本块, 兜底找独立号码
+        num = re.search(r'(?<!\d)(2\d{19})(?!\d)', text)
     date = re.search(r'(\d{4})年(\d{2})月(\d{2})日', text)
 
     # 销售方: 找以91开头的企业统一社会信用代码, 在其前后窗口内提取名称
@@ -255,3 +317,19 @@ def extract_invoice(pdf_path):
         '备注': remark,
         '明细': items,
     }
+
+
+def extract_invoice(pdf_path):
+    """从单个发票文件(PDF/OFD)提取发票信息(含商品明细), 返回 dict."""
+    if str(pdf_path).lower().endswith('.ofd'):
+        return _extract_ofd(pdf_path)
+    base = os.path.basename(pdf_path)
+    try:
+        doc = fitz.open(pdf_path)
+        text = ''.join(p.get_text() for p in doc)
+        items = extract_items(doc)
+        doc.close()
+    except Exception as e:  # noqa: BLE001
+        return {'文件名': base, '金额': None, '税额': None, '价税合计': None,
+                '备注': 'PDF读取失败: %s' % e, '明细': []}
+    return _finish(base, text, items)

@@ -7,12 +7,19 @@ buildqt/*
 
 # 打包配置跟着源码走, 换台机器也能直接打包
 !buildqt/发票助手Qt.spec
+!buildqt/发票助手Qt_dir.spec
 !buildqt/fapiao.ico
+
+# UPX 本地下载的二进制, 不进仓库
+tools/upx/*.exe
+tools/upx/*.zip
 
 # 运行时生成
 __pycache__/
 *.pyc
 _files/
+node_modules/
+buildqt/_webtest/
 
 # 本机文件 / 输出
 *.lnk

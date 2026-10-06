@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>发票助手 · 极简版</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; background: #eef1f6; color: #24292f; font-size: 14px; }
+  header { background: linear-gradient(90deg,#1f6feb,#3a86ff); color: #fff; padding: 14px 20px; }
+  header h1 { font-size: 17px; display: inline-block; }
+  header .tip { font-size: 12px; opacity: .8; margin-left: 12px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 14px; }
+  #drop { border: 2px dashed #9dc0ff; background: #fff; border-radius: 12px; padding: 28px 16px; text-align: center; color: #57606a; cursor: pointer; }
+  #drop.hover { background: #f3f7ff; border-color: #1f6feb; }
+  #drop b { color: #1f6feb; }
+  .kpis { display: flex; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+  .kpi { flex: 1; min-width: 130px; background: #fff; border: 1px solid #e3e8ef; border-radius: 10px; padding: 10px 14px; }
+  .kpi .k { font-size: 11px; color: #8a9199; }
+  .kpi .v { font-size: 18px; font-weight: bold; color: #1c2430; }
+  .kpi.accent .v { color: #1f6feb; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; font-size: 13px; }
+  th { background: #f7f9fc; color: #444c56; text-align: left; padding: 8px 9px; border-bottom: 1px solid #e6ebf2; font-size: 12px; white-space: nowrap; }
+  td { padding: 8px 9px; border-bottom: 1px solid #f1f3f6; word-break: break-all; }
+  tr.inv { cursor: pointer; }
+  tr.inv:hover td { background: #f2f7ff; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  .st-ok { color: #1a7f37; } .st-bad { color: #cf222e; } .st-warn { color: #9a6700; }
+  tr.detail td { background: #fafbfd; padding: 0 8px 8px; }
+  .sub { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .sub th { background: #fff; padding: 5px 6px; }
+  .sub td { padding: 5px 6px; border-bottom: 1px dashed #edf0f4; }
+  .empty { color: #aeb4bc; text-align: center; padding: 26px !important; }
+  .toolbar { display: flex; gap: 8px; margin: 12px 0; }
+  button { background: linear-gradient(180deg,#2f7dff,#1f6feb); color: #fff; border: none; border-radius: 7px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button.ghost { background: #fff; color: #33404f; border: 1px solid #d7dee7; }
+  button:disabled { opacity: .5; cursor: default; }
+  .del { color: #b1b6bb; cursor: pointer; font-weight: bold; padding: 0 4px; }
+  .del:hover { color: #cf222e; }
+  footer { text-align: center; color: #aeb4bc; font-size: 12px; padding: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧾 发票助手 · 极简版</h1>
+  <span class="tip">纯浏览器本地解析 · 文件不上传 · 无历史记录</span>
+</header>
+<main>
+  <div id="drop">
+    <b>点这里选择发票 PDF</b>，或把文件拖进来<br>
+    <span style="font-size:12px">支持多选 · 解析完全在本机浏览器内完成</span>
+    <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">发票张数</div><div class="v" id="kN">0</div></div>
+    <div class="kpi"><div class="k">金额(不含税)</div><div class="v" id="kAmt">0.00</div></div>
+    <div class="kpi"><div class="k">税额</div><div class="v" id="kTax">0.00</div></div>
+    <div class="kpi accent"><div class="k">价税合计</div><div class="v" id="kTot">0.00</div></div>
+  </div>
+
+  <div class="toolbar">
+    <button id="btnCsv" class="ghost" disabled>导出 CSV</button>
+    <button id="btnClear" class="ghost" disabled>清空列表</button>
+    <span id="status" style="color:#8a9199;font-size:12px;align-self:center"></span>
+  </div>
+
+  <table>
+    <thead><tr>
+      <th>文件名</th><th>发票号码</th><th>开票日期</th><th>销售方</th>
+      <th class="num">金额</th><th class="num">税额</th><th class="num">价税合计</th><th>状态</th><th></th>
+    </tr></thead>
+    <tbody id="tbody"><tr class="inv"><td colspan="9" class="empty">还没有发票 · 上面添加</td></tr></tbody>
+  </table>
+</main>
+<footer>刷新页面即清空 · 不保存任何记录 · 与桌面版共用同一套解析规则</footer>
+
+<script src="../发票解析.web.js"></script>
+<script type="module">
+import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
+
+const state = [];          // {id, file, inv, expanded}
+let seq = 0, busy = false;
+
+const $ = id => document.getElementById(id);
+const fmt = n => (n == null ? '' : Number(n).toFixed(2));
+
+const drop = $('drop'), fileInput = $('file');
+drop.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => addFiles(fileInput.files));
+['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add('hover');
+}));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove('hover');
+}));
+drop.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+
+async function addFiles(fileList) {
+  const pdfs = [...fileList].filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  if (!pdfs.length) return;
+  busy = true; render();
+  for (const f of pdfs) {
+    $('status').textContent = '解析中: ' + f.name;
+    try {
+      const buf = await f.arrayBuffer();
+      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+      const inv = await window.FapiaoWeb.extractInvoice(doc, f.name);
+      await doc.destroy();
+      state.push({ id: ++seq, file: f, inv });
+    } catch (e) {
+      state.push({ id: ++seq, file: f, inv: {
+        '文件名': f.name, '金额': null, '税额': null, '价税合计': null,
+        '备注': '解析失败: ' + e, '明细': [] } });
+    }
+    render();
+  }
+  busy = false; $('status').textContent = ''; render();
+}
+
+function render() {
+  const tb = $('tbody');
+  if (!state.length) {
+    tb.innerHTML = '<tr class="inv"><td colspan="9" class="empty">还没有发票 · 上面添加</td></tr>';
+  } else {
+    tb.innerHTML = '';
+    state.forEach(rec => {
+      const inv = rec.inv;
+      const bad = inv['价税合计'] == null;
+      const dup = inv['备注'] && inv['备注'].indexOf('不一致') >= 0;
+      const st = bad ? '<span class="st-bad">失败</span>'
+        : dup ? '<span class="st-warn">有备注</span>'
+        : '<span class="st-ok">OK</span>';
+      const tr = document.createElement('tr');
+      tr.className = 'inv';
+      tr.innerHTML = `<td>${esc(inv['文件名'])}</td>`
+        + `<td>${esc(inv['发票号码'])}</td><td>${esc(inv['开票日期'])}</td>`
+        + `<td>${esc(inv['销售方'])}</td>`
+        + `<td class="num">${fmt(inv['金额'])}</td><td class="num">${fmt(inv['税额'])}</td>`
+        + `<td class="num"><b>${fmt(inv['价税合计'])}</b></td><td>${st}</td>`
+        + `<td><span class="del" data-del="${rec.id}" title="从列表移除">×</span></td>`;
+      tr.addEventListener('click', e => {
+        if (e.target.dataset.del) return;
+        rec.expanded = !rec.expanded; render();
+      });
+      tb.appendChild(tr);
+      if (rec.expanded) {
+        const dtr = document.createElement('tr');
+        dtr.className = 'detail';
+        const items = inv['明细'] || [];
+        dtr.innerHTML = '<td colspan="9">' + (items.length
+          ? '<table class="sub"><tr><th>商品名称</th><th>规格型号</th><th>数量</th>'
+            + '<th>单价</th><th>金额</th><th>税率</th><th>税额</th><th>小计</th></tr>'
+            + items.map(it => {
+                const has = it['金额'] != null && it['税额'] != null;
+                return `<tr><td>${esc(it['名称'])}</td><td>${esc(it['规格'] || '')}</td>`
+                  + `<td class="num">${fmt(it['数量'])}</td><td class="num">${fmt(it['单价'])}</td>`
+                  + `<td class="num">${fmt(it['金额'])}</td><td>${esc(it['税率'] || '')}</td>`
+                  + `<td class="num">${fmt(it['税额'])}</td><td class="num">${has ? fmt(it['金额'] + it['税额']) : ''}</td></tr>`;
+              }).join('') + '</table>'
+          : '<span style="color:#8a9199;font-size:12px">未解析到商品明细</span>')
+          + (inv['备注'] ? `<div style="color:#9a6700;font-size:12px;margin-top:5px">备注: ${esc(inv['备注'])}</div>` : '')
+          + '</td>';
+        tb.appendChild(dtr);
+      }
+    });
+  }
+
+  let n = 0, amt = 0, tax = 0, tot = 0;
+  state.forEach(rec => {
+    const inv = rec.inv;
+    if (inv['价税合计'] != null) {
+      n++; amt += inv['金额'] || 0; tax += inv['税额'] || 0; tot += inv['价税合计'];
+    }
+  });
+  $('kN').textContent = n;
+  $('kAmt').textContent = amt.toFixed(2);
+  $('kTax').textContent = tax.toFixed(2);
+  $('kTot').textContent = tot.toFixed(2);
+  $('btnCsv').disabled = $('btnClear').disabled = !state.length;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+$('btnClear').addEventListener('click', () => { state.length = 0; render(); });
+
+$('btnCsv').addEventListener('click', () => {
+  const head = ['文件名', '发票号码', '开票日期', '销售方', '商品名称', '规格型号',
+    '数量', '单价', '金额', '税率', '税额', '价税合计', '备注'];
+  const rows = [head];
+  state.forEach(rec => {
+    const inv = rec.inv;
+    const items = (inv['明细'] && inv['明细'].length) ? inv['明细']
+      : [{ '名称': '', '规格': '', '数量': null, '单价': null, '金额': null, '税率': '', '税额': null }];
+    items.forEach(it => rows.push([
+      inv['文件名'], inv['发票号码'], inv['开票日期'], inv['销售方'],
+      it['名称'], it['规格'] || '', it['数量'] ?? '', it['单价'] ?? '',
+      it['金额'] ?? '', it['税率'] || '', it['税额'] ?? '', inv['价税合计'] ?? '', inv['备注'] || '',
+    ]));
+  });
+  const csv = '\ufeff' + rows.map(r =>
+    r.map(v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(',')
+  ).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = '发票统计_' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click(); URL.revokeObjectURL(a.href);
+});
+</script>
+</body>
+</html>

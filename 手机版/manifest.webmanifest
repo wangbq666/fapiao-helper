@@ -1,0 +1,32 @@
+{
+  "name": "发票助手 手机版",
+  "short_name": "发票助手",
+  "description": "微信/QQ 收到的电子发票 PDF 汇总统计, 全程本机解析",
+  "lang": "zh-CN",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#eef1f6",
+  "theme_color": "#1f6feb",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "file_handlers": [
+    {
+      "action": "./index.html",
+      "accept": { "application/pdf": [".pdf"] }
+    }
+  ],
+  "share_target": {
+    "action": "./index.html?share-target=1",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "files": [
+        { "name": "files", "accept": ["application/pdf", ".pdf"] }
+      ]
+    }
+  }
+}

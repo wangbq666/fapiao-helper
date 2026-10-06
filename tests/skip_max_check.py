@@ -12,6 +12,9 @@ TEST_DIR = os.environ.get(                      # 测试发票目录(按需覆�
     'FAPIAO_TEST_DIR', r'C:\Users\yqh\Desktop\nj542发票')
 
 os.environ['FAPIAO_HIST'] = os.path.join(TMP, 'hist_skip.json')
+os.environ['FAPIAO_SETTINGS'] = os.path.join(TMP, 'fp_test.ini')
+os.environ['FAPIAO_NO_SESSION'] = '1'
+
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8',
                               errors='replace')

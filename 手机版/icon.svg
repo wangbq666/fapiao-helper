@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect x="40" y="40" width="432" height="432" rx="96" fill="#1f6feb"/>
+  <rect x="130" y="96" width="252" height="320" rx="24" fill="#ffffff"/>
+  <rect x="170" y="140" width="172" height="18" rx="9" fill="#cfe0ff"/>
+  <rect x="170" y="180" width="120" height="12" rx="6" fill="#dde5f2"/>
+  <rect x="170" y="208" width="150" height="12" rx="6" fill="#dde5f2"/>
+  <rect x="170" y="236" width="100" height="12" rx="6" fill="#dde5f2"/>
+  <text x="256" y="392" font-family="Microsoft YaHei, PingFang SC, sans-serif"
+        font-size="150" font-weight="bold" fill="#1f6feb"
+        text-anchor="middle">¥</text>
+</svg>
