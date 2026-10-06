@@ -9,7 +9,7 @@
 
 | 资产 | 说明 |
 |------|------|
-| `fapiao-helper-desktop-v2.1.exe` | **桌面版 v2.1（最新）**：搜索 / 排序 / 去重 / 深色模式等 |
+| `fapiao-helper-desktop-v2.1.exe` | **桌面版 v2.1（最新，约 37MB）**：搜索 / 排序 / 去重 / 深色模式等 |
 | `fapiao-helper-desktop-v2.0.exe` | 桌面版 v2.0：历史记忆 |
 | `fapiao-helper-desktop-v1.1.exe` | 桌面版旧版（PySide6） |
 | `fapiao-helper-v1.0.exe` | 网页版：双击后自动打开浏览器 |
