@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.wangbq.fapiao",
+        "sha256_cert_fingerprints": ["BF:6D:3F:6F:1B:86:9D:7C:0B:44:29:8D:1D:1F:15:06:61:41:8D:71:5D:0E:4F:BB:D9:79:FD:8D:08:A8:1E:92"]
+      }
+    }]
