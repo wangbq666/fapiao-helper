@@ -81,7 +81,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path in ('/', '/index.html'):
-                with open(os.path.join(APP_DIR, 'index.html'), 'rb') as f:
+                with open(os.path.join(APP_DIR, chr(32593)+chr(39029)+chr(29256)+chr(26087), 'index.html'), 'rb') as f:
                     self._send(200, f.read(), 'text/html; charset=utf-8')
             elif path == '/api/file':
                 self._file()
