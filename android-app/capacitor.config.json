@@ -1,0 +1,6 @@
+{
+  "appId": "com.wangbq.fapiao",
+  "appName": "发票助手",
+  "webDir": "www",
+  "android": { "allowMixedContent": false }
+}

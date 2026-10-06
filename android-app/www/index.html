@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6feb">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>发票助手</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; background: #eef1f6; color: #24292f; font-size: 15px; padding-bottom: 76px; }
+  header { background: linear-gradient(90deg,#1f6feb,#3a86ff); color: #fff; padding: 13px 16px; position: sticky; top: 0; z-index: 9; }
+  header h1 { font-size: 16px; display: inline; }
+  header .tip { display: block; font-size: 11px; opacity: .85; margin-top: 2px; }
+  main { padding: 12px; }
+  #add { display: block; width: 100%; border: 2px dashed #9dc0ff; background: #fff; border-radius: 14px; padding: 20px; text-align: center; color: #1f6feb; font-size: 16px; font-weight: bold; cursor: pointer; }
+  #add small { display: block; font-weight: normal; color: #8a9199; font-size: 12px; margin-top: 4px; }
+  .kpis { display: flex; gap: 8px; margin: 12px 0; }
+  .kpi { flex: 1; background: #fff; border: 1px solid #e3e8ef; border-radius: 10px; padding: 8px 6px; text-align: center; }
+  .kpi .k { font-size: 10px; color: #8a9199; }
+  .kpi .v { font-size: 15px; font-weight: bold; }
+  .kpi.accent { background: #1f6feb; border-color: #1f6feb; }
+  .kpi.accent .k { color: rgba(255,255,255,.75); }
+  .kpi.accent .v { color: #fff; }
+  .card { background: #fff; border: 1px solid #e3e8ef; border-radius: 12px; margin-bottom: 10px; overflow: hidden; }
+  .card .head { padding: 11px 13px; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .card .head:active { background: #f2f7ff; }
+  .card .name { flex: 1; min-width: 0; }
+  .card .name b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .name span { font-size: 11px; color: #8a9199; }
+  .card .tot { font-weight: bold; color: #1a7f37; white-space: nowrap; }
+  .card .badge { font-size: 10px; padding: 2px 7px; border-radius: 8px; background: #eaf2ff; color: #1f6feb; flex-shrink: 0; }
+  .card .badge.bad { background: #ffe9e6; color: #cf222e; }
+  .card .del { color: #b1b6bb; padding: 6px; font-size: 17px; flex-shrink: 0; }
+  .card .body { border-top: 1px solid #f1f3f6; padding: 8px 10px; font-size: 12px; }
+  .item { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px dashed #edf0f4; }
+  .item:last-child { border-bottom: none; }
+  .item .n { flex: 1; min-width: 0; }
+  .item .m { white-space: nowrap; color: #1c2430; }
+  .item .m s { color: #8a9199; text-decoration: none; font-size: 10px; margin-left: 4px; }
+  .meta { color: #8a9199; font-size: 11px; margin-top: 4px; word-break: break-all; }
+  .empty { text-align: center; color: #aeb4bc; padding: 30px 0; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 10px; }
+  button { flex: 1; background: #fff; color: #33404f; border: 1px solid #d7dee7; border-radius: 9px; padding: 9px; font-size: 13px; cursor: pointer; }
+  button:disabled { opacity: .5; }
+  #bottom { position: fixed; left: 0; right: 0; bottom: 0; background: #fff; border-top: 1px solid #e3e8ef; padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); display: flex; justify-content: space-between; align-items: center; }
+  #bottom .lbl { font-size: 11px; color: #8a9199; }
+  #bottom .v { font-size: 19px; font-weight: bold; color: #1f6feb; }
+  footer { text-align: center; color: #aeb4bc; font-size: 11px; padding: 12px; }
+  #status { text-align: center; color: #1f6feb; font-size: 12px; padding: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧾 发票助手</h1>
+  <span class="tip">微信 / QQ 里收到的发票 → 转发/下载后从这里加入 · 全程本机解析</span>
+</header>
+<main>
+  <div id="add">＋ 添加发票 PDF<small>从微信/QQ下载的文件、本机文件都可以选</small></div>
+  <input id="file" type="file" accept="application/pdf,.pdf" multiple hidden>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">张数</div><div class="v" id="kN">0</div></div>
+    <div class="kpi"><div class="k">金额</div><div class="v" id="kAmt">0.00</div></div>
+    <div class="kpi"><div class="k">税额</div><div class="v" id="kTax">0.00</div></div>
+    <div class="kpi accent"><div class="k">价税合计</div><div class="v" id="kTot">0.00</div></div>
+  </div>
+
+  <div id="status"></div>
+  <div id="list"><div class="empty">还没有发票，点上面「＋ 添加发票 PDF」</div></div>
+  <div class="toolbar">
+    <button id="btnCsv" disabled>导出 CSV</button>
+    <button id="btnClear" disabled>清空</button>
+  </div>
+</main>
+<div id="bottom">
+  <div><div class="lbl">报销合计（价税）</div><div class="v" id="bTot">0.00</div></div>
+  <div style="text-align:right"><div class="lbl">已选 <span id="bN">0</span> 张</div></div>
+</div>
+<footer>无历史记录 · 刷新即清空 · 数据不出手机</footer>
+
+<script src="./pdf.min.js"></script>
+<script src="./发票解析.web.js"></script>
+<script>
+const pdfjsLib = window.pdfjsLib;
+pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.min.js';
+
+const state = [];
+let seq = 0, busy = false;
+const $ = id => document.getElementById(id);
+const fmt = n => (n == null ? '' : Number(n).toFixed(2));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+$('add').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', () => addFiles($('file').files));
+
+/* 安装为 PWA 后, 系统里「打开方式/分享」给的 PDF 从这里进来 */
+/* 桌面浏览器的文件句柄(离线 APK 里没有, 保留无害) */
+if ('launchQueue' in window) {
+  launchQueue.setConsumer(async params => {
+    if (!params.files || !params.files.length) return;
+    const handles = params.files.filter(h => /\.pdf$/i.test(h.name));
+    busyFilter(handles);
+  });
+  async function busyFilter(handles) {
+    busy = true; render();
+    for (const h of handles) {
+      try {
+        const f = await h.getFile();
+        await parse(f);
+      } catch (e) { /* 忽略打不开的句柄 */ }
+    }
+    busy = false; render();
+  }
+}
+
+/* 从分享面板(Web Share Target)进来的文件 */
+if (location.hash === '#shared') {
+  history.replaceState(null, '', './index.html');
+  fetch('__shared__').then(r => {
+    if (!r.ok) return;
+    caches.open('fapiao-share').then(c => c.delete('__shared__'));
+    return r.blob();
+  }).then(b => { if (b && b.size) addFiles([new File([b], '分享的发票.pdf', { type: 'application/pdf' })]); })
+    .catch(() => {});
+}
+
+async function addFiles(fileList) {
+  const pdfs = [...fileList].filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  if (!pdfs.length) { setStatus('没有可解析的 PDF 文件'); return; }
+  busy = true; render();
+  for (const f of pdfs) {
+    setStatus('解析中: ' + f.name);
+    try {
+      const buf = await f.arrayBuffer();
+      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+      const inv = await window.FapiaoWeb.extractInvoice(doc, f.name);
+      await doc.destroy();
+      state.push({ id: ++seq, inv, expanded: false });
+    } catch (e) {
+      state.push({ id: ++seq, expanded: false, inv: {
+        '文件名': f.name, '金额': null, '税额': null, '价税合计': null,
+        '备注': '解析失败: ' + e, '明细': [] } });
+    }
+    render();
+  }
+  busy = false; setStatus(''); render();
+}
+
+function setStatus(s) { $('status').textContent = s; }
+
+function render() {
+  const list = $('list');
+  if (!state.length) {
+    list.innerHTML = '<div class="empty">还没有发票，点上面「＋ 添加发票 PDF」</div>';
+  } else {
+    list.innerHTML = '';
+    state.forEach(rec => {
+      const inv = rec.inv;
+      const bad = inv['价税合计'] == null;
+      const card = document.createElement('div');
+      card.className = 'card';
+      const items = inv['明细'] || [];
+      const badge = bad ? '<span class="badge bad">失败</span>'
+        : (inv['备注'] ? '<span class="badge bad">有备注</span>'
+                       : '<span class="badge">OK</span>');
+      card.innerHTML =
+        `<div class="head">
+           <div class="name"><b>${esc(inv['文件名'])}</b>
+             <span>${esc(inv['销售方'] || '销售方未知')}${inv['开票日期'] ? ' · ' + esc(inv['开票日期']) : ''}</span></div>
+           ${badge}
+           <div class="tot">${fmt(inv['价税合计'])}</div>
+           <div class="del" data-del="${rec.id}">×</div>
+         </div>` +
+        (rec.expanded
+          ? `<div class="body">${items.length
+              ? items.map(it => {
+                  const has = it['金额'] != null && it['税额'] != null;
+                  return `<div class="item"><div class="n">${esc(it['名称'])}`
+                    + (it['规格'] ? `<span style="color:#8a9199"> ${esc(it['规格'])}</span>` : '')
+                    + `</div><div class="m">${fmt(it['金额'])}<s>+${fmt(it['税额'])}税</s>`
+                    + (has ? ` <b>${fmt(it['金额'] + it['税额'])}</b>` : '') + `</div></div>`;
+                }).join('')
+              : '<div style="color:#8a9199">未解析到商品明细</div>'}
+             ${inv['备注'] ? `<div class="meta" style="color:#9a6700">备注: ${esc(inv['备注'])}</div>` : ''}
+             <div class="meta">号码: ${esc(inv['发票号码'] || '-')} · 日期: ${esc(inv['开票日期'] || '-')}</div>
+           </div>` : '');
+      card.querySelector('.head').addEventListener('click', e => {
+        if (e.target.dataset.del !== undefined) return;
+        rec.expanded = !rec.expanded; render();
+      });
+      card.querySelector('.del').addEventListener('click', () => {
+        state.splice(state.indexOf(rec), 1); render();
+      });
+      list.appendChild(card);
+    });
+  }
+
+  let n = 0, amt = 0, tax = 0, tot = 0;
+  state.forEach(rec => {
+    const inv = rec.inv;
+    if (inv['价税合计'] != null) {
+      n++; amt += inv['金额'] || 0; tax += inv['税额'] || 0; tot += inv['价税合计'];
+    }
+  });
+  $('kN').textContent = n; $('kAmt').textContent = amt.toFixed(2);
+  $('kTax').textContent = tax.toFixed(2); $('kTot').textContent = tot.toFixed(2);
+  $('bTot').textContent = tot.toFixed(2); $('bN').textContent = n;
+  $('btnCsv').disabled = $('btnClear').disabled = !state.length;
+}
+
+$('btnClear').addEventListener('click', () => { state.length = 0; render(); });
+
+$('btnCsv').addEventListener('click', () => {
+  const head = ['文件名', '发票号码', '开票日期', '销售方', '商品名称', '规格型号',
+    '数量', '单价', '金额', '税率', '税额', '价税合计', '备注'];
+  const rows = [head];
+  state.forEach(rec => {
+    const inv = rec.inv;
+    const items = (inv['明细'] && inv['明细'].length) ? inv['明细']
+      : [{ '名称': '', '规格': '', '数量': null, '单价': null, '金额': null, '税率': '', '税额': null }];
+    items.forEach(it => rows.push([
+      inv['文件名'], inv['发票号码'], inv['开票日期'], inv['销售方'],
+      it['名称'], it['规格'] || '', it['数量'] ?? '', it['单价'] ?? '',
+      it['金额'] ?? '', it['税率'] || '', it['税额'] ?? '', inv['价税合计'] ?? '', inv['备注'] || '',
+    ]));
+  });
+  const csv = '\ufeff' + rows.map(r =>
+    r.map(v => { v = String(v ?? ''); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(',')
+  ).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = '发票统计_' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click(); URL.revokeObjectURL(a.href);
+});
+
+/* 微信/QQ 分享进来的文件: 原生层写到 cache/shared-latest.pdf 后通知这里 */
+const CapFs = (window.Capacitor && Capacitor.Plugins && Capacitor.Plugins.Filesystem) || null;
+async function checkNativeShare() {
+  if (!CapFs) return;
+  try {
+    await CapFs.stat({ path: 'shared-latest.pdf', directory: 'CACHE' });
+  } catch (e) { return; }
+  try {
+    const res = await CapFs.readFile({ path: 'shared-latest.pdf', directory: 'CACHE',
+                                       encoding: 'BASE64' });
+    const bytes = Uint8Array.from(atob(res.data), c => c.charCodeAt(0));
+    const f = new File([bytes], '微信或QQ分享的发票.pdf', { type: 'application/pdf' });
+    await CapFs.deleteFile({ path: 'shared-latest.pdf', directory: 'CACHE' });
+    addFiles([f]);
+  } catch (e) { /* 忽略 */ }
+}
+document.addEventListener('DOMContentLoaded', checkNativeShare);
+window.__checkNativeShare = checkNativeShare;
+</script>
+</body>
+</html>
