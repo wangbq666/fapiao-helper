@@ -59,8 +59,10 @@ public class MainActivity extends BridgeActivity {
 
     private void notifyWebView() {
         try {
-            bridge.executeScript(
-                "window.__checkNativeShare && window.__checkNativeShare();");
+            android.webkit.WebView wv = bridge.getWebView();
+            if (wv == null) return;
+            wv.evaluateJavascript(
+                "window.__checkNativeShare && window.__checkNativeShare();", null);
         } catch (Exception ignored) {
             // WebView 还没就绪; JS 启动时会自己查缓存
         }
